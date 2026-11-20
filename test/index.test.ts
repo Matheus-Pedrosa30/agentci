@@ -336,3 +336,23 @@ describe("agentci doctor", () => {
     expect(result.stderr).toContain("SQLite path is not a writable file.");
   });
 });
+
+describe("agentci start", () => {
+  it("loads the source command and rejects incomplete trusted configuration", () => {
+    const directory = mkdtempSync(join(tmpdir(), "agentci-start-cli-"));
+    const config = join(directory, "agentci.config.mjs");
+    writeFileSync(config, "export default {};\n");
+
+    const result = spawnSync(
+      process.execPath,
+      [resolve("src/cli.ts"), "start", "--config", config],
+      { encoding: "utf8" },
+    );
+
+    expect({ status: result.status, stdout: result.stdout, stderr: result.stderr }).toEqual({
+      status: 1,
+      stdout: "",
+      stderr: "AgentCI failed to start: trusted configuration is incomplete.\n",
+    });
+  });
+});
