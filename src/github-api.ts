@@ -70,28 +70,59 @@ export function createGitHubAppIntakeApi(options: GitHubAppApiOptions): GitHubIn
       return Buffer.from(value.content.replace(/\s/gu, ""), "base64").toString("utf8");
     },
     async getWorkflowJobs(input) {
-      const response = await fetchGitHub(
-        `${repositoryUrl(input.owner, input.repository)}/actions/runs/${encodeURIComponent(input.runId)}/jobs`,
-        { headers: await installationHeaders(input.installationId) },
-      );
-      if (!response.ok) throw new Error("GitHub workflow job retrieval failed.");
-      const value = (await response.json()) as { jobs?: unknown };
-      if (!Array.isArray(value.jobs)) throw new Error("GitHub returned invalid workflow jobs.");
-      return value.jobs.flatMap((job) => {
-        if (
-          typeof job === "object" &&
-          job !== null &&
-          "name" in job &&
-          typeof job.name === "string" &&
-          "conclusion" in job &&
-          (typeof job.conclusion === "string" || job.conclusion === null)
-        ) {
-          return [{ name: job.name, conclusion: job.conclusion }];
+      const jobs: { name: string; conclusion: string | null }[] = [];
+      for (let page = 1; ; page += 1) {
+        const response = await fetchGitHub(
+          `${repositoryUrl(input.owner, input.repository)}/actions/runs/${encodeURIComponent(input.runId)}/jobs?per_page=100&page=${page}`,
+          { headers: await installationHeaders(input.installationId) },
+        );
+        if (!response.ok) throw new Error("GitHub workflow job retrieval failed.");
+        const value = (await response.json()) as { jobs?: unknown };
+        if (!Array.isArray(value.jobs)) throw new Error("GitHub returned invalid workflow jobs.");
+        for (const job of value.jobs) {
+          if (
+            typeof job === "object" &&
+            job !== null &&
+            "name" in job &&
+            typeof job.name === "string" &&
+            "conclusion" in job &&
+            (typeof job.conclusion === "string" || job.conclusion === null)
+          ) {
+            jobs.push({ name: job.name, conclusion: job.conclusion });
+          }
         }
-        return [];
-      });
+        if (value.jobs.length < 100) return jobs;
+      }
     },
-    async createInitialCheck(input) {
+    async ensureInitialCheck(input) {
+      for (let page = 1; ; page += 1) {
+        const existingResponse = await fetchGitHub(
+          `${repositoryUrl(input.owner, input.repository)}/commits/${encodeURIComponent(input.revision)}/check-runs?check_name=AgentCI&filter=all&per_page=100&page=${page}`,
+          { headers: await installationHeaders(input.installationId) },
+        );
+        if (!existingResponse.ok) throw new Error("GitHub Check reconciliation failed.");
+        const value = (await existingResponse.json()) as { check_runs?: unknown };
+        if (!Array.isArray(value.check_runs)) {
+          throw new Error("GitHub returned invalid Check reconciliation data.");
+        }
+        if (
+          value.check_runs.some(
+            (check) =>
+              typeof check === "object" &&
+              check !== null &&
+              "external_id" in check &&
+              check.external_id === input.externalId &&
+              "app" in check &&
+              typeof check.app === "object" &&
+              check.app !== null &&
+              "id" in check.app &&
+              check.app.id === Number(options.appId),
+          )
+        ) {
+          return;
+        }
+        if (value.check_runs.length < 100) break;
+      }
       const response = await fetchGitHub(
         `${repositoryUrl(input.owner, input.repository)}/check-runs`,
         {

@@ -21,7 +21,7 @@ function fakeGitHub(): GitHubIntakeApi {
     async getWorkflowJobs() {
       throw new Error("not expected");
     },
-    async createInitialCheck() {
+    async ensureInitialCheck() {
       throw new Error("not expected");
     },
   };
@@ -92,7 +92,7 @@ describe("signed GitHub webhook intake", () => {
       async getWorkflowJobs() {
         return [{ name: "test", conclusion: "failure" }];
       },
-      async createInitialCheck(input) {
+      async ensureInitialCheck(input) {
         checks.push(input);
       },
     };
@@ -153,7 +153,7 @@ describe("signed GitHub webhook intake", () => {
       async getWorkflowJobs() {
         return [{ name: "test", conclusion: "failure" }];
       },
-      async createInitialCheck(input) {
+      async ensureInitialCheck(input) {
         checks.push(input);
       },
     };
@@ -186,6 +186,82 @@ describe("signed GitHub webhook intake", () => {
     restarted.close();
   });
 
+  it("deduplicates concurrent deliveries atomically", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "agentci-intake-"));
+    const intake = createWebhookIntake({
+      databasePath: join(directory, "agentci.sqlite"),
+      webhookSecret: "test-webhook-secret",
+      aliases: { models: ["repair"], runtimes: ["node-24"] },
+      github: {
+        async getRepositoryContract() {
+          return validContract;
+        },
+        async getWorkflowJobs() {
+          return [{ name: "test", conclusion: "failure" }];
+        },
+        async ensureInitialCheck() {
+          throw new Error("not expected");
+        },
+      },
+    });
+    const delivery = {
+      event: "workflow_run",
+      deliveryId: "concurrent-delivery",
+      signature: signature(payload),
+      body: payload,
+    };
+
+    const results = await Promise.all([intake.receive(delivery), intake.receive(delivery)]);
+
+    expect(results.map((result) => result.outcome).sort()).toEqual(["ignored", "queued"]);
+    expect(results.every((result) => result.status === 202)).toBe(true);
+    expect(intake.listAttempts()).toHaveLength(1);
+    intake.close();
+  });
+
+  it("reconciles an ambiguous Check success after restart", async () => {
+    const directory = mkdtempSync(join(tmpdir(), "agentci-intake-"));
+    const databasePath = join(directory, "agentci.sqlite");
+    const checkExternalIds = new Set<string>();
+    let firstRequest = true;
+    const options = {
+      databasePath,
+      webhookSecret: "test-webhook-secret",
+      aliases: { models: ["repair"], runtimes: ["node-24"] },
+      github: {
+        async getRepositoryContract() {
+          return validContract;
+        },
+        async getWorkflowJobs() {
+          return [{ name: "test", conclusion: "failure" }];
+        },
+        async ensureInitialCheck(input: { externalId: string }) {
+          if (checkExternalIds.has(input.externalId)) return;
+          checkExternalIds.add(input.externalId);
+          if (firstRequest) {
+            firstRequest = false;
+            throw new Error("ambiguous network failure after GitHub accepted the Check");
+          }
+        },
+      },
+    };
+    const first = createWebhookIntake(options);
+    await first.receive({
+      event: "workflow_run",
+      deliveryId: "ambiguous-check",
+      signature: signature(payload),
+      body: payload,
+    });
+    await expect(first.workOnce()).rejects.toThrow("ambiguous network failure");
+    first.close();
+
+    const restarted = createWebhookIntake(options);
+    await expect(restarted.workOnce()).resolves.toBe(true);
+    await expect(restarted.workOnce()).resolves.toBe(false);
+    expect(checkExternalIds).toEqual(new Set(["agentci-repair-attempt-1"]));
+    restarted.close();
+  });
+
   it.each([
     ["workflow", { workflow: "Other" }, [{ name: "test", conclusion: "failure" }]],
     ["job", {}, [{ name: "test", conclusion: "success" }]],
@@ -206,7 +282,7 @@ describe("signed GitHub webhook intake", () => {
         async getWorkflowJobs() {
           return jobs;
         },
-        async createInitialCheck() {
+        async ensureInitialCheck() {
           throw new Error("not expected");
         },
       },

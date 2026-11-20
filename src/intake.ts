@@ -16,7 +16,7 @@ export interface GitHubIntakeApi {
     repository: string;
     runId: string;
   }): Promise<readonly { name: string; conclusion: string | null }[]>;
-  createInitialCheck(input: {
+  ensureInitialCheck(input: {
     installationId: number;
     owner: string;
     repository: string;
@@ -203,13 +203,18 @@ export function createWebhookIntake(options: IntakeOptions): WebhookIntake {
         return { status: 422, outcome: "rejected" };
       }
 
-      const runExists = database
-        .prepare("SELECT 1 FROM repair_attempts WHERE workflow_run_id = ?")
-        .get(String(payload.workflow_run.id));
-
       database.exec("BEGIN IMMEDIATE");
       try {
-        database
+        const deliveryInsert = database
+          .prepare(
+            "INSERT OR IGNORE INTO webhook_deliveries (delivery_id, workflow_run_id) VALUES (?, ?)",
+          )
+          .run(delivery.deliveryId, String(payload.workflow_run.id));
+        if (deliveryInsert.changes === 0) {
+          database.exec("COMMIT");
+          return { status: 202, outcome: "ignored" };
+        }
+        const attemptInsert = database
           .prepare(
             `INSERT OR IGNORE INTO repair_attempts
               (workflow_run_id, status, repository, branch, revision, workflow, job,
@@ -227,15 +232,15 @@ export function createWebhookIntake(options: IntakeOptions): WebhookIntake {
             contract.runtime,
             payload.installation.id,
           );
-        database
-          .prepare("INSERT INTO webhook_deliveries (delivery_id, workflow_run_id) VALUES (?, ?)")
-          .run(delivery.deliveryId, String(payload.workflow_run.id));
         database.exec("COMMIT");
+        return {
+          status: 202,
+          outcome: attemptInsert.changes === 0 ? "ignored" : "queued",
+        };
       } catch (error) {
         database.exec("ROLLBACK");
         throw error;
       }
-      return { status: 202, outcome: runExists ? "ignored" : "queued" };
     },
     listAttempts() {
       return database
@@ -263,7 +268,7 @@ export function createWebhookIntake(options: IntakeOptions): WebhookIntake {
         | undefined;
       if (!attempt) return false;
       const [owner, repository] = attempt.repository.split("/") as [string, string];
-      await options.github.createInitialCheck({
+      await options.github.ensureInitialCheck({
         owner,
         repository,
         installationId: attempt.installationId,

@@ -36,7 +36,7 @@ it("serves health and signed webhook endpoints while its serial worker creates t
       async getWorkflowJobs() {
         return [{ name: "test", conclusion: "failure" }];
       },
-      async createInitialCheck(input) {
+      async ensureInitialCheck(input) {
         checks.push(input);
       },
     },
