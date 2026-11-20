@@ -88,6 +88,15 @@ export function redactAndBoundSummary(source: string): string {
   return summary || "Failure analysis did not provide a safe explanation.";
 }
 
+export function redactAndBoundSourceFile(source: string): string {
+  let content = redact(source);
+  if (Buffer.byteLength(content, "utf8") > MAX_LOG_BYTES) {
+    content = Buffer.from(content, "utf8").subarray(0, MAX_LOG_BYTES).toString("utf8");
+    while (Buffer.byteLength(content, "utf8") > MAX_LOG_BYTES) content = content.slice(0, -1);
+  }
+  return content;
+}
+
 export function buildModelEvidence(
   failure: PrimaryFailure,
   allowedPaths: readonly string[] = [],
