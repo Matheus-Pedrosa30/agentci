@@ -132,6 +132,19 @@ function usageCount(value: number | undefined): number | null {
   return typeof value === "number" && Number.isSafeInteger(value) && value >= 0 ? value : null;
 }
 
+function validFailureAnalysis(value: unknown): value is FailureAnalysis {
+  if (typeof value !== "object" || value === null) return false;
+  const analysis = value as Partial<FailureAnalysis>;
+  return (
+    typeof analysis.actionable === "boolean" &&
+    typeof analysis.summary === "string" &&
+    Array.isArray(analysis.requestedFiles) &&
+    analysis.requestedFiles.every((path) => typeof path === "string") &&
+    (analysis.usage === undefined ||
+      (typeof analysis.usage === "object" && analysis.usage !== null))
+  );
+}
+
 function parseWorkflowRun(body: Uint8Array): WorkflowRunPayload | undefined {
   try {
     const payload = object(JSON.parse(Buffer.from(body).toString("utf8")));
@@ -431,9 +444,13 @@ export function createWebhookIntake(options: IntakeOptions): WebhookIntake {
               } else {
                 let analysis: FailureAnalysis;
                 try {
-                  analysis = await options.analyzer.analyzeFailure(
+                  const result: unknown = await options.analyzer.analyzeFailure(
                     buildModelEvidence(identification.failure, allowlist.patterns),
                   );
+                  if (!validFailureAnalysis(result)) {
+                    throw new Error("Invalid failure analysis.");
+                  }
+                  analysis = result;
                 } catch {
                   unresolved("Failure analysis could not be completed.");
                   analysis = {

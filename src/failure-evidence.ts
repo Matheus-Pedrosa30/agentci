@@ -54,6 +54,20 @@ function containsUnsafeControlCharacter(source: string): boolean {
   return false;
 }
 
+function isSafeRelativePath(path: string, allowGlobs: boolean): boolean {
+  return (
+    path.length > 0 &&
+    path === path.normalize("NFC") &&
+    !path.startsWith("/") &&
+    !path.includes("\\") &&
+    !path.includes(":") &&
+    !containsUnsafeControlCharacter(path) &&
+    (allowGlobs ||
+      (!path.includes("*") && !path.includes("?") && !path.includes("[") && !path.includes("]"))) &&
+    !path.split("/").some((part) => part === "" || part === "." || part === "..")
+  );
+}
+
 function redact(source: string): string {
   return stripAnsi(source)
     .replace(/(authorization\s*:\s*bearer\s+)[^\s]+/giu, "$1[REDACTED]")
@@ -101,17 +115,7 @@ export function validateAllowedFilePatterns(patterns: readonly string[]):
       outcome: "rejected";
       explanation: string;
     } {
-  if (
-    patterns.length === 0 ||
-    patterns.some(
-      (pattern) =>
-        pattern.length === 0 ||
-        pattern.startsWith("/") ||
-        pattern.includes("\\") ||
-        pattern.includes(":") ||
-        pattern.split("/").some((part) => part === "" || part === "." || part === ".."),
-    )
-  ) {
+  if (patterns.length === 0 || patterns.some((pattern) => !isSafeRelativePath(pattern, true))) {
     return {
       outcome: "rejected",
       explanation: "Repository Contract contains an unsafe allowed path pattern.",
@@ -121,14 +125,7 @@ export function validateAllowedFilePatterns(patterns: readonly string[]):
 }
 
 function allowedPath(path: string, patterns: readonly string[]): boolean {
-  if (
-    path.length === 0 ||
-    path.startsWith("/") ||
-    path.includes("\\") ||
-    path.split("/").some((part) => part === "" || part === "." || part === "..")
-  ) {
-    return false;
-  }
+  if (!isSafeRelativePath(path, false)) return false;
   return patterns.some((pattern) => {
     let source = "^";
     for (let index = 0; index < pattern.length; index += 1) {
@@ -177,7 +174,14 @@ export function identifyPrimaryFailure(
     };
   }
   const job = jobs[0];
-  const step = job?.steps.find((candidate) => candidate.conclusion === "failure");
+  const step = job?.steps
+    .filter(
+      (candidate) =>
+        candidate.conclusion === "failure" &&
+        Number.isSafeInteger(candidate.number) &&
+        candidate.number > 0,
+    )
+    .toSorted((left, right) => left.number - right.number)[0];
   if (!job || !step) {
     return { outcome: "unresolved", explanation: "No failed step could be identified safely." };
   }

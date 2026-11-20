@@ -305,3 +305,122 @@ it("retains usage but only a redacted summary when analysis is not actionable", 
   );
   intake.close();
 });
+
+it("turns malformed analyzer output into a terminal redacted Unresolved Repair", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "agentci-primary-failure-"));
+  const updates: unknown[] = [];
+  const intake = createWebhookIntake({
+    databasePath: join(directory, "agentci.sqlite"),
+    webhookSecret: "test-webhook-secret",
+    aliases: { models: ["repair"], runtimes: ["node-24"] },
+    github: {
+      async getRepositoryContract() {
+        return contract;
+      },
+      async getWorkflowJobs() {
+        return [
+          {
+            id: "17",
+            name: "test",
+            conclusion: "failure",
+            steps: [{ number: 1, name: "Tests", conclusion: "failure" }],
+          },
+        ];
+      },
+      async getWorkflowJobLog() {
+        return "test failed";
+      },
+      async ensureInitialCheck() {},
+      async updateCheck(input) {
+        updates.push(input);
+      },
+    },
+    analyzer: {
+      async analyzeFailure() {
+        return { actionable: true, summary: "invalid", requestedFiles: undefined } as never;
+      },
+    },
+  });
+  const signature = `sha256=${createHmac("sha256", "test-webhook-secret").update(payload).digest("hex")}`;
+  await intake.receive({
+    event: "workflow_run",
+    deliveryId: "malformed-analysis",
+    signature,
+    body: payload,
+  });
+
+  await expect(intake.workOnce()).resolves.toBe(true);
+  expect(intake.listAttempts()[0]).toEqual(
+    expect.objectContaining({
+      status: "unresolved",
+      summary: "Unresolved Repair: Failure analysis could not be completed.",
+    }),
+  );
+  expect(updates).toEqual([
+    expect.objectContaining({ status: "completed", conclusion: "neutral" }),
+  ]);
+  intake.close();
+});
+
+it("reconciles a persisted Primary Failure Check after restart without another model call", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "agentci-primary-failure-"));
+  const databasePath = join(directory, "agentci.sqlite");
+  let analysisCalls = 0;
+  let updateCalls = 0;
+  const options = {
+    databasePath,
+    webhookSecret: "test-webhook-secret",
+    aliases: { models: ["repair"], runtimes: ["node-24"] },
+    github: {
+      async getRepositoryContract() {
+        return contract;
+      },
+      async getWorkflowJobs() {
+        return [
+          {
+            id: "17",
+            name: "test",
+            conclusion: "failure",
+            steps: [{ number: 1, name: "Tests", conclusion: "failure" }],
+          },
+        ];
+      },
+      async getWorkflowJobLog() {
+        return "test failed";
+      },
+      async ensureInitialCheck() {},
+      async updateCheck() {
+        updateCalls += 1;
+        if (updateCalls === 1) throw new Error("ambiguous Check update failure");
+      },
+    },
+    analyzer: {
+      async analyzeFailure() {
+        analysisCalls += 1;
+        return {
+          actionable: true,
+          summary: "A deterministic failure.",
+          requestedFiles: ["src/a.ts"],
+        };
+      },
+    },
+  };
+  const signature = `sha256=${createHmac("sha256", "test-webhook-secret").update(payload).digest("hex")}`;
+  const first = createWebhookIntake(options);
+  await first.receive({
+    event: "workflow_run",
+    deliveryId: "restart-primary-failure",
+    signature,
+    body: payload,
+  });
+  await expect(first.workOnce()).rejects.toThrow("ambiguous Check update failure");
+  expect(first.listAttempts()[0]).toEqual(expect.objectContaining({ status: "primary_failure" }));
+  first.close();
+
+  const restarted = createWebhookIntake(options);
+  await expect(restarted.workOnce()).resolves.toBe(true);
+  await expect(restarted.workOnce()).resolves.toBe(false);
+  expect(analysisCalls).toBe(1);
+  expect(updateCalls).toBe(2);
+  restarted.close();
+});

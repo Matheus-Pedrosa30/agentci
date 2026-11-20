@@ -35,6 +35,28 @@ describe("Primary Failure identification", () => {
     });
   });
 
+  it("selects the lowest failed step number when GitHub returns steps out of order", () => {
+    const result = identifyPrimaryFailure([
+      {
+        id: "job-17",
+        name: "test",
+        conclusion: "failure",
+        steps: [
+          { number: 7, name: "Cleanup", conclusion: "failure" },
+          { number: 3, name: "Unit tests", conclusion: "failure" },
+        ],
+        log: "test output",
+      },
+    ]);
+
+    expect(result).toEqual(
+      expect.objectContaining({
+        outcome: "identified",
+        failure: expect.objectContaining({ stepNumber: 3, stepName: "Unit tests" }),
+      }),
+    );
+  });
+
   it("refuses multiple configured failed jobs instead of guessing", () => {
     const job = {
       id: "job-17",
@@ -142,6 +164,14 @@ describe("bounded model evidence", () => {
       explanation: "Failure analysis requested more than five files.",
     });
     expect(validateRequestedFiles(["../secret", ".github/workflows/ci.yml"], ["src/**"])).toEqual({
+      outcome: "rejected",
+      explanation: "Failure analysis requested a file outside allowed paths.",
+    });
+    expect(validateRequestedFiles(["src/*.ts"], ["src/**"])).toEqual({
+      outcome: "rejected",
+      explanation: "Failure analysis requested a file outside allowed paths.",
+    });
+    expect(validateRequestedFiles(["src/file.ts:private"], ["src/**"])).toEqual({
       outcome: "rejected",
       explanation: "Failure analysis requested a file outside allowed paths.",
     });
