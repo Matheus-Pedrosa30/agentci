@@ -4,6 +4,9 @@
   "description": "AI-powered CI/CD repair agent.",
   "private": true,
   "type": "module",
+  "bin": {
+    "agentci": "./dist/cli.js"
+  },
   "engines": {
     "node": ">=24",
     "npm": ">=11"
