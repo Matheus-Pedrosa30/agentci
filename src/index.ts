@@ -25,5 +25,16 @@ export type {
 } from "./intake.ts";
 export { parseRepositoryContract } from "./repository-contract.ts";
 export type { RepositoryContract } from "./repository-contract.ts";
+export { createRepairOrchestrator } from "./repair-orchestrator.ts";
+export type {
+  GitHubPublication,
+  RepairAttemptInput,
+  RepairAttemptPersistence,
+  RepairClock,
+  RepairProposal,
+  RepairProposalChange,
+  RepairProvider,
+  SandboxRuntime,
+} from "./repair-orchestrator.ts";
 export { startAgentCiService } from "./start.ts";
 export type { RunningAgentCiService } from "./start.ts";

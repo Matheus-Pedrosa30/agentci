@@ -12,10 +12,10 @@ it("publishes one validated Repair Proposal as a Draft Repair PR through fake bo
       async readTrackedTextFiles(input) {
         calls.push({ kind: "read", value: input });
         return {
-          "src/math.ts": `${"// padding\n".repeat(5_000)}export const add = () => 1;\nAPI_TOKEN=source-secret`,
+          "src/math.ts": "export const add = () => 1;\nAPI_TOKEN=source-secret\n",
         };
       },
-      async publishValidatedRepair(input) {
+      async ensureValidatedRepair(input) {
         calls.push({ kind: "publish", value: input });
         pullRequests.push(input);
         return { number: 41, url: "https://example.invalid/pull/41" };
@@ -25,6 +25,7 @@ it("publishes one validated Repair Proposal as a Draft Repair PR through fake bo
       },
     },
     provider: {
+      alias: "repair",
       async analyzeFailure(input) {
         calls.push({ kind: "analyze", value: input });
         return {
@@ -47,7 +48,7 @@ it("publishes one validated Repair Proposal as a Draft Repair PR through fake bo
           usage: { inputTokens: 80, outputTokens: 30 },
         };
       },
-      provider: "fake-provider",
+      provider: "fake-provider TOKEN=provider-secret",
       model: "fake-model",
     },
     sandbox: {
@@ -75,12 +76,12 @@ it("publishes one validated Repair Proposal as a Draft Repair PR through fake bo
       runtimeAlias: "node-24",
       allowedPaths: ["src/**"],
       installCommand: ["npm", "ci", "--ignore-scripts"],
-      validationCommand: ["npm", "test"],
+      validationCommand: ["npm", "test", "API_TOKEN=command-secret"],
       primaryFailure: {
         jobId: "17",
-        jobName: "test",
+        jobName: "test TOKEN=job-secret",
         stepNumber: 2,
-        stepName: "Unit tests",
+        stepName: "Unit tests PASSWORD=step-secret",
         log: `expected 3, received 1\nAuthorization: Bearer log-secret\n${"x\n".repeat(250)}`,
       },
     }),
@@ -105,6 +106,7 @@ it("publishes one validated Repair Proposal as a Draft Repair PR through fake bo
   expect(transitions).toEqual([
     { attemptId: "attempt-7", status: "proposing", at: "2026-11-20T12:00:00.000Z" },
     { attemptId: "attempt-7", status: "validating", at: "2026-11-20T12:00:00.000Z" },
+    { attemptId: "attempt-7", status: "publishing", at: "2026-11-20T12:00:00.000Z" },
     { attemptId: "attempt-7", status: "validated", at: "2026-11-20T12:00:00.000Z" },
   ]);
   expect(pullRequests).toEqual([
@@ -123,14 +125,18 @@ it("publishes one validated Repair Proposal as a Draft Repair PR through fake bo
     }),
   ]);
   const report = JSON.stringify({ pullRequests, checks });
-  expect(report).toContain("Primary Failure: test / Unit tests (step 2)");
+  expect(report).toContain(
+    "Primary Failure: test TOKEN=[REDACTED] / Unit tests PASSWORD=[REDACTED] (step 2)",
+  );
   expect(report).toContain("src/math.ts");
-  expect(report).toContain("npm test");
-  expect(report).toContain("fake-provider/fake-model");
+  expect(report).toContain("npm test API_TOKEN=[REDACTED]");
+  expect(report).toContain("fake-provider TOKEN=[REDACTED]/fake-model");
   expect(report).toContain("Proposal count: 1");
   expect(report).toContain("Input tokens: 200; output tokens: 50");
   expect(report).toContain("expected 3, received 1");
-  expect(report).not.toMatch(/log-secret|source-secret|provider-secret|credentials|merge/u);
+  expect(report).not.toMatch(
+    /log-secret|source-secret|provider-secret|command-secret|job-secret|step-secret|credentials|merge/u,
+  );
   expect(checks).toEqual([
     expect.objectContaining({
       repository: "owner/repository",
@@ -141,7 +147,26 @@ it("publishes one validated Repair Proposal as a Draft Repair PR through fake bo
   ]);
 });
 
-it("rejects malformed structured proposal data before sandbox mutation or publication", async () => {
+it.each([
+  {
+    name: "a traversal path",
+    proposal: { summary: "malformed", changes: [{ path: "../secret", content: "stolen" }] },
+  },
+  {
+    name: "more than 200 changed lines",
+    proposal: {
+      summary: "too large",
+      changes: [{ path: "src/math.ts", content: "changed\n".repeat(201) }],
+    },
+  },
+  {
+    name: "non-text output",
+    proposal: {
+      summary: "binary-like",
+      changes: [{ path: "src/math.ts", content: "export const value = '\u0000';\n" }],
+    },
+  },
+])("rejects $name before sandbox mutation or publication", async ({ proposal }) => {
   const boundaryCalls: string[] = [];
   const transitions: unknown[] = [];
   const checks: unknown[] = [];
@@ -150,7 +175,7 @@ it("rejects malformed structured proposal data before sandbox mutation or public
       async readTrackedTextFiles() {
         return { "src/math.ts": "export const add = () => 1;\n" };
       },
-      async publishValidatedRepair() {
+      async ensureValidatedRepair() {
         boundaryCalls.push("publish");
         return { number: 1, url: "https://example.invalid/pull/1" };
       },
@@ -159,13 +184,14 @@ it("rejects malformed structured proposal data before sandbox mutation or public
       },
     },
     provider: {
+      alias: "repair",
       provider: "fake-provider",
       model: "fake-model",
       async analyzeFailure() {
         return { actionable: true, summary: "bad addition", requestedFiles: ["src/math.ts"] };
       },
       async proposeRepair() {
-        return { summary: "malformed", changes: [{ path: "../secret", content: "stolen" }] };
+        return proposal;
       },
     },
     sandbox: {
@@ -226,7 +252,7 @@ it("does not publish when the fake sandbox rejects the Repair Proposal", async (
       async readTrackedTextFiles() {
         return { "src/math.ts": "export const add = () => 1;\n" };
       },
-      async publishValidatedRepair() {
+      async ensureValidatedRepair() {
         boundaryCalls.push("publish");
         return { number: 1, url: "https://example.invalid/pull/1" };
       },
@@ -235,6 +261,7 @@ it("does not publish when the fake sandbox rejects the Repair Proposal", async (
       },
     },
     provider: {
+      alias: "repair",
       provider: "fake-provider",
       model: "fake-model",
       async analyzeFailure() {
@@ -298,6 +325,155 @@ it("does not publish when the fake sandbox rejects the Repair Proposal", async (
   expect(JSON.stringify(checks)).not.toContain("sandbox-secret");
 });
 
+it.each([
+  {
+    name: "non-actionable analysis",
+    analysis: { actionable: false, summary: "not actionable", requestedFiles: [] },
+  },
+  {
+    name: "an out-of-allowlist file request",
+    analysis: { actionable: true, summary: "unsafe request", requestedFiles: ["private/key"] },
+  },
+  {
+    name: "malformed analysis",
+    analysis: { actionable: true, summary: "malformed", requestedFiles: undefined },
+  },
+])("durably completes the Check for $name", async ({ analysis }) => {
+  const transitions: unknown[] = [];
+  const checks: unknown[] = [];
+  const orchestrator = createRepairOrchestrator({
+    github: {
+      async readTrackedTextFiles() {
+        throw new Error("source files must not be read");
+      },
+      async ensureValidatedRepair() {
+        throw new Error("a Repair PR must not be published");
+      },
+      async completeCheck(input) {
+        checks.push(input);
+      },
+    },
+    provider: {
+      alias: "repair",
+      provider: "fake-provider",
+      model: "fake-model",
+      async analyzeFailure() {
+        return analysis as never;
+      },
+      async proposeRepair() {
+        throw new Error("a Repair Proposal must not be requested");
+      },
+    },
+    sandbox: {
+      async validate() {
+        throw new Error("the sandbox must not run");
+      },
+    },
+    persistence: {
+      async transition(input) {
+        transitions.push(input);
+      },
+    },
+    clock: { now: () => new Date("2026-11-20T12:00:00.000Z") },
+  });
+
+  await expect(
+    orchestrator.advance({
+      attemptId: "attempt-analysis",
+      runId: "9006",
+      repository: "owner/repository",
+      revision: "analysis123",
+      defaultBranch: "main",
+      modelAlias: "repair",
+      runtimeAlias: "node-24",
+      allowedPaths: ["src/**"],
+      installCommand: ["npm", "ci"],
+      validationCommand: ["npm", "test"],
+      primaryFailure: {
+        jobId: "17",
+        jobName: "test",
+        stepNumber: 2,
+        stepName: "Unit tests",
+        log: "expected 3, received 1",
+      },
+    }),
+  ).resolves.toEqual({ outcome: "unresolved" });
+
+  expect(transitions).toEqual([
+    { attemptId: "attempt-analysis", status: "unresolved", at: "2026-11-20T12:00:00.000Z" },
+  ]);
+  expect(checks).toEqual([expect.objectContaining({ conclusion: "neutral" })]);
+});
+
+it("rejects a passing sandbox result that reports different changed files", async () => {
+  const events: string[] = [];
+  const statuses: string[] = [];
+  const orchestrator = createRepairOrchestrator({
+    github: {
+      async readTrackedTextFiles() {
+        return { "src/math.ts": "export const value = 1;\n" };
+      },
+      async ensureValidatedRepair() {
+        events.push("publish");
+        return { number: 1, url: "https://example.invalid/pull/1" };
+      },
+      async completeCheck() {
+        events.push("check");
+      },
+    },
+    provider: {
+      alias: "repair",
+      provider: "fake-provider",
+      model: "fake-model",
+      async analyzeFailure() {
+        return { actionable: true, summary: "bad value", requestedFiles: ["src/math.ts"] };
+      },
+      async proposeRepair() {
+        return {
+          summary: "change value",
+          changes: [{ path: "src/math.ts", content: "export const value = 2;\n" }],
+        };
+      },
+    },
+    sandbox: {
+      async validate() {
+        return { outcome: "passed", changedFiles: ["src/unrelated.ts"] } as const;
+      },
+    },
+    persistence: {
+      async transition(input) {
+        statuses.push(input.status);
+      },
+    },
+    clock: { now: () => new Date("2026-11-20T12:00:00.000Z") },
+  });
+
+  await expect(
+    orchestrator.advance({
+      attemptId: "attempt-mismatch",
+      runId: "9007",
+      repository: "owner/repository",
+      revision: "mismatch123",
+      defaultBranch: "main",
+      modelAlias: "repair",
+      runtimeAlias: "node-24",
+      allowedPaths: ["src/**"],
+      installCommand: ["npm", "ci"],
+      validationCommand: ["npm", "test"],
+      primaryFailure: {
+        jobId: "17",
+        jobName: "test",
+        stepNumber: 2,
+        stepName: "Unit tests",
+        log: "expected 2, received 1",
+      },
+    }),
+  ).resolves.toEqual({ outcome: "unresolved" });
+
+  expect(events).toEqual(["check"]);
+  expect(statuses).toEqual(["proposing", "validating", "unresolved"]);
+});
+
 it("refuses a proposal containing credential-like content before mutation or publication", async () => {
   const boundaryCalls: string[] = [];
   const orchestrator = createRepairOrchestrator({
@@ -305,13 +481,14 @@ it("refuses a proposal containing credential-like content before mutation or pub
       async readTrackedTextFiles() {
         return { "src/math.ts": "export const add = () => 1;\n" };
       },
-      async publishValidatedRepair() {
+      async ensureValidatedRepair() {
         boundaryCalls.push("publish");
         return { number: 1, url: "https://example.invalid/pull/1" };
       },
       async completeCheck() {},
     },
     provider: {
+      alias: "repair",
       provider: "fake-provider",
       model: "fake-model",
       async analyzeFailure() {
@@ -365,13 +542,14 @@ it("never publishes a repair branch over the default branch", async () => {
       async readTrackedTextFiles() {
         return { "src/math.ts": "export const add = () => 1;\n" };
       },
-      async publishValidatedRepair() {
+      async ensureValidatedRepair() {
         published = true;
         return { number: 1, url: "https://example.invalid/pull/1" };
       },
       async completeCheck() {},
     },
     provider: {
+      alias: "repair",
       provider: "fake-provider",
       model: "fake-model",
       async analyzeFailure() {

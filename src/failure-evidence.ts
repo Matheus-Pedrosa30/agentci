@@ -29,7 +29,7 @@ export interface ModelFailureEvidence {
 }
 
 const MAX_LOG_LINES = 200;
-const MAX_LOG_BYTES = 32_768;
+const MAX_MODEL_CONTENT_BYTES = 32_768;
 
 function stripAnsi(source: string): string {
   let result = "";
@@ -82,6 +82,13 @@ function redact(source: string): string {
     );
 }
 
+function boundUtf8(source: string, maximumBytes: number): string {
+  if (Buffer.byteLength(source, "utf8") <= maximumBytes) return source;
+  let bounded = Buffer.from(source, "utf8").subarray(0, maximumBytes).toString("utf8");
+  while (Buffer.byteLength(bounded, "utf8") > maximumBytes) bounded = bounded.slice(0, -1);
+  return bounded;
+}
+
 export function redactAndBoundSummary(source: string): string {
   let summary = redact(source).replace(/\s+/gu, " ").trim();
   if (summary.length > 1_000) summary = `${summary.slice(0, 997)}...`;
@@ -89,12 +96,7 @@ export function redactAndBoundSummary(source: string): string {
 }
 
 export function redactAndBoundSourceFile(source: string): string {
-  let content = redact(source);
-  if (Buffer.byteLength(content, "utf8") > MAX_LOG_BYTES) {
-    content = Buffer.from(content, "utf8").subarray(0, MAX_LOG_BYTES).toString("utf8");
-    while (Buffer.byteLength(content, "utf8") > MAX_LOG_BYTES) content = content.slice(0, -1);
-  }
-  return content;
+  return boundUtf8(redact(source), MAX_MODEL_CONTENT_BYTES);
 }
 
 export function buildModelEvidence(
@@ -102,14 +104,11 @@ export function buildModelEvidence(
   allowedPaths: readonly string[] = [],
 ): ModelFailureEvidence {
   let log = redact(failure.log).split(/\r?\n/u).slice(0, MAX_LOG_LINES).join("\n");
-  if (Buffer.byteLength(log, "utf8") > MAX_LOG_BYTES) {
-    log = Buffer.from(log, "utf8").subarray(0, MAX_LOG_BYTES).toString("utf8");
-    while (Buffer.byteLength(log, "utf8") > MAX_LOG_BYTES) log = log.slice(0, -1);
-  }
+  log = boundUtf8(log, MAX_MODEL_CONTENT_BYTES);
   return {
-    jobName: failure.jobName,
+    jobName: redactAndBoundSummary(failure.jobName),
     stepNumber: failure.stepNumber,
-    stepName: failure.stepName,
+    stepName: redactAndBoundSummary(failure.stepName),
     log,
     allowedPaths,
   };
