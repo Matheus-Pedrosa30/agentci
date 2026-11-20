@@ -1,6 +1,7 @@
 import { expect, it } from "vitest";
 
 import { createRepairOrchestrator } from "../src/repair-orchestrator.js";
+import { primaryFailureIdentity } from "../src/proposal-policy.js";
 
 it("publishes one validated Repair Proposal as a Draft Repair PR through fake boundaries", async () => {
   const calls: { kind: string; value: unknown }[] = [];
@@ -593,4 +594,174 @@ it("never publishes a repair branch over the default branch", async () => {
     }),
   ).resolves.toEqual({ outcome: "unresolved" });
   expect(published).toBe(false);
+});
+
+it("tries at most three proposals for the same Primary Failure and reports bounded rejections and usage", async () => {
+  const events: string[] = [];
+  const checks: { body: string }[] = [];
+  const identity = primaryFailureIdentity({
+    revision: "budget123",
+    workflow: "",
+    jobId: "17",
+    stepNumber: 2,
+    evidence: "expected 2, received 1",
+  });
+  let proposalNumber = 0;
+  const orchestrator = createRepairOrchestrator({
+    github: {
+      async readTrackedTextFiles() {
+        return { "src/math.ts": "export const value = 1;\n" };
+      },
+      async ensureValidatedRepair() {
+        events.push("publish");
+        return { number: 1, url: "https://example.invalid/pull/1" };
+      },
+      async completeCheck(input) {
+        checks.push(input);
+      },
+    },
+    provider: {
+      alias: "repair",
+      provider: "fake-provider",
+      model: "fake-model",
+      async analyzeFailure() {
+        return {
+          actionable: true,
+          summary: "bad value",
+          requestedFiles: ["src/math.ts"],
+          usage: { inputTokens: 10, outputTokens: 1 },
+        };
+      },
+      async proposeRepair() {
+        proposalNumber += 1;
+        events.push(`propose-${proposalNumber}`);
+        return {
+          summary: `raw model response ${proposalNumber} TOKEN=must-not-persist`,
+          changes: [
+            { path: "src/math.ts", content: `export const value = ${proposalNumber + 1};\n` },
+          ],
+          usage: { inputTokens: 20, outputTokens: 2 },
+        };
+      },
+    },
+    sandbox: {
+      async validate() {
+        events.push(`validate-${proposalNumber}`);
+        return {
+          outcome: "failed",
+          observedFailureIdentity: identity,
+          summary: `attempt ${proposalNumber} remains red TOKEN=sandbox-secret`,
+        } as const;
+      },
+    },
+    persistence: { async transition() {} },
+    clock: { now: () => new Date("2026-11-20T12:00:00.000Z") },
+  });
+
+  await expect(
+    orchestrator.advance({
+      attemptId: "attempt-budget",
+      runId: "9010",
+      repository: "owner/repository",
+      revision: "budget123",
+      defaultBranch: "main",
+      modelAlias: "repair",
+      runtimeAlias: "node-24",
+      allowedPaths: ["src/**"],
+      installCommand: ["npm", "ci"],
+      validationCommand: ["npm", "test"],
+      primaryFailure: {
+        jobId: "17",
+        jobName: "test",
+        stepNumber: 2,
+        stepName: "Unit tests",
+        log: "expected 2, received 1",
+      },
+    }),
+  ).resolves.toEqual({ outcome: "unresolved" });
+
+  expect(events).toEqual([
+    "propose-1",
+    "validate-1",
+    "propose-2",
+    "validate-2",
+    "propose-3",
+    "validate-3",
+  ]);
+  expect(checks[0]?.body).toContain("Proposal count: 3");
+  expect(checks[0]?.body).toContain("Rejected proposals: 1. attempt 1 remains red");
+  expect(checks[0]?.body).toContain("Input tokens: 70; output tokens: 7");
+  expect(JSON.stringify(checks)).not.toMatch(/must-not-persist|sandbox-secret/u);
+});
+
+it("stops after one proposal when validation reveals a different Primary Failure", async () => {
+  let proposals = 0;
+  let validations = 0;
+  const different = primaryFailureIdentity({
+    revision: "chain123",
+    workflow: "",
+    jobId: "17",
+    stepNumber: 5,
+    evidence: "a later step failed",
+  });
+  const orchestrator = createRepairOrchestrator({
+    github: {
+      async readTrackedTextFiles() {
+        return { "src/math.ts": "export const value = 1;\n" };
+      },
+      async ensureValidatedRepair() {
+        throw new Error("must not publish");
+      },
+      async completeCheck() {},
+    },
+    provider: {
+      alias: "repair",
+      provider: "fake-provider",
+      model: "fake-model",
+      async analyzeFailure() {
+        return { actionable: true, summary: "bad value", requestedFiles: ["src/math.ts"] };
+      },
+      async proposeRepair() {
+        proposals += 1;
+        return {
+          summary: "change value",
+          changes: [{ path: "src/math.ts", content: "export const value = 2;\n" }],
+        };
+      },
+    },
+    sandbox: {
+      async validate() {
+        validations += 1;
+        return {
+          outcome: "failed",
+          observedFailureIdentity: different,
+          summary: "a later step failed",
+        } as const;
+      },
+    },
+    persistence: { async transition() {} },
+    clock: { now: () => new Date("2026-11-20T12:00:00.000Z") },
+  });
+
+  await orchestrator.advance({
+    attemptId: "attempt-chain",
+    runId: "9011",
+    repository: "owner/repository",
+    revision: "chain123",
+    defaultBranch: "main",
+    modelAlias: "repair",
+    runtimeAlias: "node-24",
+    allowedPaths: ["src/**"],
+    installCommand: ["npm", "ci"],
+    validationCommand: ["npm", "test"],
+    primaryFailure: {
+      jobId: "17",
+      jobName: "test",
+      stepNumber: 2,
+      stepName: "Unit tests",
+      log: "expected 2, received 1",
+    },
+  });
+
+  expect({ proposals, validations }).toEqual({ proposals: 1, validations: 1 });
 });

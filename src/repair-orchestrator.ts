@@ -6,17 +6,19 @@ import {
   type ModelFailureEvidence,
   type PrimaryFailure,
 } from "./failure-evidence.ts";
+import {
+  classifyValidation,
+  evaluateProposal,
+  primaryFailureIdentity,
+  type PolicyProposal,
+} from "./proposal-policy.ts";
 
 export interface RepairProposalChange {
   path: string;
   content: string;
 }
 
-export interface RepairProposal {
-  summary: string;
-  changes: readonly RepairProposalChange[];
-  usage?: TokenUsage;
-}
+export type RepairProposal = PolicyProposal;
 
 interface TokenUsage {
   inputTokens?: number;
@@ -36,6 +38,7 @@ export interface RepairProvider {
   proposeRepair(input: {
     evidence: ModelFailureEvidence;
     files: Readonly<Record<string, string>>;
+    previousRejections: readonly string[];
   }): Promise<unknown>;
 }
 
@@ -49,7 +52,8 @@ export interface SandboxRuntime {
     proposal: RepairProposal;
     signal?: AbortSignal;
   }): Promise<
-    { outcome: "passed"; changedFiles: readonly string[] } | { outcome: "failed"; summary: string }
+    | { outcome: "passed"; changedFiles: readonly string[] }
+    | { outcome: "failed"; summary: string; observedFailureIdentity?: string }
   >;
 }
 
@@ -94,6 +98,7 @@ export interface RepairAttemptInput {
   runId: string;
   repository: string;
   revision: string;
+  workflow?: string;
   defaultBranch: string;
   modelAlias: string;
   runtimeAlias: string;
@@ -143,64 +148,19 @@ function parseAnalysis(value: unknown):
   };
 }
 
-function parseProposal(
-  value: unknown,
-  availableFiles: Readonly<Record<string, string>>,
-): RepairProposal | undefined {
-  if (typeof value !== "object" || value === null) return undefined;
-  const candidate = value as Partial<RepairProposal>;
-  if (
-    typeof candidate.summary !== "string" ||
-    candidate.summary.length === 0 ||
-    candidate.summary.length > 1_000 ||
-    !Array.isArray(candidate.changes) ||
-    candidate.changes.length === 0 ||
-    candidate.changes.length > 3 ||
-    (candidate.usage !== undefined && !validUsage(candidate.usage))
-  ) {
-    return undefined;
-  }
-  const changes: RepairProposalChange[] = [];
-  const seen = new Set<string>();
-  let changedLines = 0;
-  for (const change of candidate.changes) {
-    if (
-      typeof change !== "object" ||
-      change === null ||
-      typeof (change as RepairProposalChange).path !== "string" ||
-      typeof (change as RepairProposalChange).content !== "string"
-    ) {
-      return undefined;
-    }
-    const typed = change as RepairProposalChange;
-    if (
-      !Object.hasOwn(availableFiles, typed.path) ||
-      seen.has(typed.path) ||
-      containsUnsafeTextControl(typed.content) ||
-      redactAndBoundSourceFile(typed.content) !== typed.content
-    ) {
-      return undefined;
-    }
-    changedLines += changedLineCount(availableFiles[typed.path] ?? "", typed.content, 200);
-    if (changedLines > 200) return undefined;
-    seen.add(typed.path);
-    changes.push({ path: typed.path, content: typed.content });
-  }
-  return {
-    summary: candidate.summary,
-    changes,
-    ...(candidate.usage ? { usage: { ...candidate.usage } } : {}),
-  };
-}
-
 function parseValidation(
   value: unknown,
 ):
   | { outcome: "passed"; changedFiles: readonly string[] }
-  | { outcome: "failed"; summary: string }
+  | { outcome: "failed"; summary: string; observedFailureIdentity?: string }
   | undefined {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
-  const candidate = value as { outcome?: unknown; changedFiles?: unknown; summary?: unknown };
+  const candidate = value as {
+    outcome?: unknown;
+    changedFiles?: unknown;
+    summary?: unknown;
+    observedFailureIdentity?: unknown;
+  };
   if (
     candidate.outcome === "passed" &&
     Array.isArray(candidate.changedFiles) &&
@@ -208,44 +168,21 @@ function parseValidation(
   ) {
     return { outcome: "passed", changedFiles: candidate.changedFiles };
   }
-  if (candidate.outcome === "failed" && typeof candidate.summary === "string") {
-    return { outcome: "failed", summary: candidate.summary };
+  if (
+    candidate.outcome === "failed" &&
+    typeof candidate.summary === "string" &&
+    (candidate.observedFailureIdentity === undefined ||
+      typeof candidate.observedFailureIdentity === "string")
+  ) {
+    return {
+      outcome: "failed",
+      summary: candidate.summary,
+      ...(candidate.observedFailureIdentity === undefined
+        ? {}
+        : { observedFailureIdentity: candidate.observedFailureIdentity }),
+    };
   }
   return undefined;
-}
-
-function changedLineCount(before: string, after: string, limit: number): number {
-  const left = before.split("\n");
-  const right = after.split("\n");
-  const furthest = new Map<number, number>([[1, 0]]);
-  const maximum = Math.min(left.length + right.length, limit + 1);
-  for (let distance = 0; distance <= maximum; distance += 1) {
-    for (let diagonal = -distance; diagonal <= distance; diagonal += 2) {
-      const down = furthest.get(diagonal + 1) ?? -1;
-      const rightward = furthest.get(diagonal - 1) ?? -1;
-      let x =
-        diagonal === -distance || (diagonal !== distance && rightward < down)
-          ? down
-          : rightward + 1;
-      if (x < 0) x = 0;
-      let y = x - diagonal;
-      while (x < left.length && y < right.length && left[x] === right[y]) {
-        x += 1;
-        y += 1;
-      }
-      furthest.set(diagonal, x);
-      if (x >= left.length && y >= right.length) return distance;
-    }
-  }
-  return limit + 1;
-}
-
-function containsUnsafeTextControl(source: string): boolean {
-  for (const character of source) {
-    const code = character.charCodeAt(0);
-    if (code < 32 && code !== 9 && code !== 10 && code !== 13) return true;
-  }
-  return false;
 }
 
 function tokenCount(usage: TokenUsage | undefined, key: keyof TokenUsage): number {
@@ -274,7 +211,15 @@ export function createRepairOrchestrator(dependencies: {
   const at = () => dependencies.clock.now().toISOString();
   return {
     async advance(attempt) {
-      const unresolved = async (reason: string): Promise<{ outcome: "unresolved" }> => {
+      const unresolved = async (
+        reason: string,
+        audit?: {
+          proposalCount: number;
+          rejections: readonly string[];
+          inputTokens: number;
+          outputTokens: number;
+        },
+      ): Promise<{ outcome: "unresolved" }> => {
         await dependencies.persistence.transition({
           attemptId: attempt.attemptId,
           status: "unresolved",
@@ -285,7 +230,16 @@ export function createRepairOrchestrator(dependencies: {
           revision: attempt.revision,
           conclusion: "neutral",
           title: "AgentCI could not validate a Repair Proposal",
-          body: `Unresolved Repair: ${redactAndBoundSummary(reason)}`,
+          body: [
+            `Unresolved Repair: ${redactAndBoundSummary(reason)}`,
+            ...(audit
+              ? [
+                  `Proposal count: ${audit.proposalCount}`,
+                  `Rejected proposals: ${audit.rejections.length === 0 ? "none" : audit.rejections.map((summary, index) => `${index + 1}. ${auditText(summary)}`).join("; ")}`,
+                  `Usage: Input tokens: ${audit.inputTokens}; output tokens: ${audit.outputTokens}`,
+                ]
+              : []),
+          ].join("\n"),
         });
         return { outcome: "unresolved" };
       };
@@ -335,61 +289,108 @@ export function createRepairOrchestrator(dependencies: {
       const files = Object.fromEntries(
         requested.files.map((path) => [path, redactAndBoundSourceFile(sources[path] as string)]),
       );
-      await dependencies.persistence.transition({
-        attemptId: attempt.attemptId,
-        status: "proposing",
-        at: at(),
+      const failureIdentity = primaryFailureIdentity({
+        revision: attempt.revision,
+        workflow: attempt.workflow ?? "",
+        jobId: attempt.primaryFailure.jobId,
+        stepNumber: attempt.primaryFailure.stepNumber,
+        evidence: attempt.primaryFailure.log,
       });
-      let proposalResult: unknown;
-      try {
-        proposalResult = await dependencies.provider.proposeRepair({ evidence, files });
-      } catch {
-        return unresolved("Repair Proposal generation could not be completed.");
-      }
-      const proposal = parseProposal(proposalResult, files);
-      if (!proposal) return unresolved("The provider returned an invalid structured proposal.");
+      const rejections: string[] = [];
+      let proposalCount = 0;
+      let inputTokens = tokenCount(analysis.usage, "inputTokens");
+      let outputTokens = tokenCount(analysis.usage, "outputTokens");
+      let proposal: RepairProposal | undefined;
+      let changedFiles: readonly string[] = [];
+      const audit = () => ({ proposalCount, rejections, inputTokens, outputTokens });
 
-      await dependencies.persistence.transition({
-        attemptId: attempt.attemptId,
-        status: "validating",
-        at: at(),
-      });
-      let validationResult: unknown;
-      try {
-        validationResult = await dependencies.sandbox.validate({
-          repository: attempt.repository,
-          revision: attempt.revision,
-          runtimeAlias: attempt.runtimeAlias,
-          installCommand: attempt.installCommand,
-          validationCommand: attempt.validationCommand,
-          proposal,
+      while (proposalCount < 3) {
+        await dependencies.persistence.transition({
+          attemptId: attempt.attemptId,
+          status: "proposing",
+          at: at(),
         });
-      } catch {
-        return unresolved("Sandbox validation could not be completed.");
-      }
-      const validation = parseValidation(validationResult);
-      if (!validation) return unresolved("Sandbox validation returned an invalid result.");
-      if (validation.outcome !== "passed") return unresolved(validation.summary);
+        let proposalResult: unknown;
+        try {
+          proposalResult = await dependencies.provider.proposeRepair({
+            evidence,
+            files,
+            previousRejections: rejections,
+          });
+        } catch {
+          return unresolved("Repair Proposal generation could not be completed.", audit());
+        }
+        proposalCount += 1;
+        const evaluation = evaluateProposal({
+          proposal: proposalResult,
+          existingTextFiles: files,
+          allowedPaths: attempt.allowedPaths,
+        });
+        const proposalUsage =
+          evaluation.outcome === "accepted" ? evaluation.proposal.usage : evaluation.usage;
+        inputTokens += tokenCount(proposalUsage, "inputTokens");
+        outputTokens += tokenCount(proposalUsage, "outputTokens");
+        if (evaluation.outcome === "rejected") {
+          rejections.push(evaluation.explanation);
+          return unresolved(evaluation.explanation, audit());
+        }
+        proposal = evaluation.proposal;
 
-      const changedFiles = proposal.changes.map((change) => change.path);
-      if (
-        validation.changedFiles.length !== changedFiles.length ||
-        validation.changedFiles.some((path) => !changedFiles.includes(path)) ||
-        changedFiles.some((path) => !validation.changedFiles.includes(path))
-      ) {
-        return unresolved("Sandbox validation reported unexpected changed files.");
+        await dependencies.persistence.transition({
+          attemptId: attempt.attemptId,
+          status: "validating",
+          at: at(),
+        });
+        let validationResult: unknown;
+        try {
+          validationResult = await dependencies.sandbox.validate({
+            repository: attempt.repository,
+            revision: attempt.revision,
+            runtimeAlias: attempt.runtimeAlias,
+            installCommand: attempt.installCommand,
+            validationCommand: attempt.validationCommand,
+            proposal,
+          });
+        } catch {
+          return unresolved("Sandbox validation could not be completed.", audit());
+        }
+        const validation = parseValidation(validationResult);
+        if (!validation) {
+          return unresolved("Sandbox validation returned an invalid result.", audit());
+        }
+        if (validation.outcome === "passed") {
+          changedFiles = proposal.changes.map((change) => change.path);
+          if (
+            validation.changedFiles.length !== changedFiles.length ||
+            validation.changedFiles.some((path) => !changedFiles.includes(path)) ||
+            changedFiles.some((path) => !validation.changedFiles.includes(path))
+          ) {
+            return unresolved("Sandbox validation reported unexpected changed files.", audit());
+          }
+          break;
+        }
+
+        rejections.push(validation.summary);
+        const classification = classifyValidation({
+          primaryFailureIdentity: failureIdentity,
+          proposalCount,
+          validation,
+        });
+        if (classification.outcome === "unresolved") {
+          return unresolved(classification.explanation, audit());
+        }
       }
-      const inputTokens =
-        tokenCount(analysis.usage, "inputTokens") + tokenCount(proposal.usage, "inputTokens");
-      const outputTokens =
-        tokenCount(analysis.usage, "outputTokens") + tokenCount(proposal.usage, "outputTokens");
+      if (!proposal || changedFiles.length === 0) {
+        return unresolved("The Repair Attempt exhausted its three-proposal budget.", audit());
+      }
       const report = [
         `Primary Failure: ${auditText(attempt.primaryFailure.jobName)} / ${auditText(attempt.primaryFailure.stepName)} (step ${attempt.primaryFailure.stepNumber})`,
         `Evidence: ${redactAndBoundSummary(evidence.log)}`,
         `Changed files: ${auditText(changedFiles.join(", "))}`,
         `Validation command: ${auditText(commandText(attempt.validationCommand))}`,
         `Provider/model: ${auditText(dependencies.provider.provider)}/${auditText(dependencies.provider.model)}`,
-        "Proposal count: 1",
+        `Proposal count: ${proposalCount}`,
+        `Rejected proposals: ${rejections.length === 0 ? "none" : rejections.map((summary, index) => `${index + 1}. ${auditText(summary)}`).join("; ")}`,
         `Usage: Input tokens: ${inputTokens}; output tokens: ${outputTokens}`,
       ].join("\n");
       const headBranch = `agentci/repair-${attempt.runId}`;
