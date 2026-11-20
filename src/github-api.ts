@@ -70,7 +70,12 @@ export function createGitHubAppIntakeApi(options: GitHubAppApiOptions): GitHubIn
       return Buffer.from(value.content.replace(/\s/gu, ""), "base64").toString("utf8");
     },
     async getWorkflowJobs(input) {
-      const jobs: { name: string; conclusion: string | null }[] = [];
+      const jobs: {
+        id?: string;
+        name: string;
+        conclusion: string | null;
+        steps?: { number: number; name: string; conclusion: string | null }[];
+      }[] = [];
       for (let page = 1; ; page += 1) {
         const response = await fetchGitHub(
           `${repositoryUrl(input.owner, input.repository)}/actions/runs/${encodeURIComponent(input.runId)}/jobs?per_page=100&page=${page}`,
@@ -88,11 +93,46 @@ export function createGitHubAppIntakeApi(options: GitHubAppApiOptions): GitHubIn
             "conclusion" in job &&
             (typeof job.conclusion === "string" || job.conclusion === null)
           ) {
-            jobs.push({ name: job.name, conclusion: job.conclusion });
+            const id =
+              "id" in job && (typeof job.id === "number" || typeof job.id === "string")
+                ? String(job.id)
+                : undefined;
+            const steps =
+              "steps" in job && Array.isArray(job.steps)
+                ? job.steps.flatMap((step: unknown) => {
+                    if (
+                      typeof step !== "object" ||
+                      step === null ||
+                      !("number" in step) ||
+                      typeof step.number !== "number" ||
+                      !("name" in step) ||
+                      typeof step.name !== "string" ||
+                      !("conclusion" in step) ||
+                      (typeof step.conclusion !== "string" && step.conclusion !== null)
+                    ) {
+                      return [];
+                    }
+                    return [{ number: step.number, name: step.name, conclusion: step.conclusion }];
+                  })
+                : undefined;
+            jobs.push({
+              name: job.name,
+              conclusion: job.conclusion,
+              ...(id ? { id } : {}),
+              ...(steps ? { steps } : {}),
+            });
           }
         }
         if (value.jobs.length < 100) return jobs;
       }
+    },
+    async getWorkflowJobLog(input) {
+      const response = await fetchGitHub(
+        `${repositoryUrl(input.owner, input.repository)}/actions/jobs/${encodeURIComponent(input.jobId)}/logs`,
+        { headers: await installationHeaders(input.installationId) },
+      );
+      if (!response.ok) throw new Error("GitHub workflow job log retrieval failed.");
+      return response.text();
     },
     async ensureInitialCheck(input) {
       for (let page = 1; ; page += 1) {
@@ -141,6 +181,56 @@ export function createGitHubAppIntakeApi(options: GitHubAppApiOptions): GitHubIn
         },
       );
       if (!response.ok) throw new Error("GitHub Check creation failed.");
+    },
+    async updateCheck(input) {
+      let checkId: string | undefined;
+      for (let page = 1; ; page += 1) {
+        const existingResponse = await fetchGitHub(
+          `${repositoryUrl(input.owner, input.repository)}/commits/${encodeURIComponent(input.revision)}/check-runs?check_name=AgentCI&filter=all&per_page=100&page=${page}`,
+          { headers: await installationHeaders(input.installationId) },
+        );
+        if (!existingResponse.ok) throw new Error("GitHub Check reconciliation failed.");
+        const value = (await existingResponse.json()) as { check_runs?: unknown };
+        if (!Array.isArray(value.check_runs)) {
+          throw new Error("GitHub returned invalid Check reconciliation data.");
+        }
+        const check = value.check_runs.find(
+          (candidate) =>
+            typeof candidate === "object" &&
+            candidate !== null &&
+            "external_id" in candidate &&
+            candidate.external_id === input.externalId &&
+            "app" in candidate &&
+            typeof candidate.app === "object" &&
+            candidate.app !== null &&
+            "id" in candidate.app &&
+            candidate.app.id === Number(options.appId) &&
+            "id" in candidate &&
+            (typeof candidate.id === "number" || typeof candidate.id === "string"),
+        ) as { id: number | string } | undefined;
+        if (check) {
+          checkId = String(check.id);
+          break;
+        }
+        if (value.check_runs.length < 100) break;
+      }
+      if (!checkId) throw new Error("AgentCI Check could not be reconciled.");
+      const response = await fetchGitHub(
+        `${repositoryUrl(input.owner, input.repository)}/check-runs/${encodeURIComponent(checkId)}`,
+        {
+          method: "PATCH",
+          headers: {
+            ...(await installationHeaders(input.installationId)),
+            "content-type": "application/json",
+          },
+          body: JSON.stringify({
+            status: input.status,
+            ...(input.conclusion ? { conclusion: input.conclusion } : {}),
+            output: { title: input.title, summary: input.summary },
+          }),
+        },
+      );
+      if (!response.ok) throw new Error("GitHub Check update failed.");
     },
   };
 }

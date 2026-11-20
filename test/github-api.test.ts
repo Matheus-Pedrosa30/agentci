@@ -71,18 +71,38 @@ it("paginates workflow jobs before deciding eligibility", async () => {
           })),
         });
       }
-      return Response.json({ jobs: [{ name: "test", conclusion: "failure" }] });
+      return Response.json({
+        jobs: [
+          {
+            id: 17,
+            name: "test",
+            conclusion: "failure",
+            steps: [
+              { number: 1, name: "Install", conclusion: "success" },
+              { number: 2, name: "Tests", conclusion: "failure" },
+            ],
+          },
+        ],
+      });
     },
   });
 
-  await expect(
-    api.getWorkflowJobs({
-      installationId: 99,
-      owner: "example",
-      repository: "repository",
-      runId: "4242",
-    }),
-  ).resolves.toHaveLength(101);
+  const jobs = await api.getWorkflowJobs({
+    installationId: 99,
+    owner: "example",
+    repository: "repository",
+    runId: "4242",
+  });
+  expect(jobs).toHaveLength(101);
+  expect(jobs).toContainEqual({
+    id: "17",
+    name: "test",
+    conclusion: "failure",
+    steps: [
+      { number: 1, name: "Install", conclusion: "success" },
+      { number: 2, name: "Tests", conclusion: "failure" },
+    ],
+  });
   expect(requestedPages).toEqual([
     "https://api.github.com/repos/example/repository/actions/runs/4242/jobs?per_page=100&page=1",
     "https://api.github.com/repos/example/repository/actions/runs/4242/jobs?per_page=100&page=2",
@@ -129,4 +149,87 @@ it("reconciles an initial Check by stable external ID after an ambiguous create 
   await expect(api.ensureInitialCheck(input)).rejects.toThrow("connection closed");
   await expect(api.ensureInitialCheck(input)).resolves.toBeUndefined();
   expect(createRequests).toBe(1);
+});
+
+it("downloads one selected workflow job log through installation authentication", async () => {
+  const privateKey = generateKeyPairSync("rsa", {
+    modulusLength: 1024,
+    privateKeyEncoding: { format: "pem", type: "pkcs8" },
+    publicKeyEncoding: { format: "pem", type: "spki" },
+  }).privateKey;
+  const requests: string[] = [];
+  const api = createGitHubAppIntakeApi({
+    appId: "12345",
+    privateKey,
+    fetch: async (input) => {
+      const url = String(input);
+      if (url.endsWith("/app/installations/99/access_tokens")) {
+        return Response.json({ token: "installation-token" });
+      }
+      requests.push(url);
+      return new Response("failed test log");
+    },
+  });
+
+  await expect(
+    api.getWorkflowJobLog?.({
+      installationId: 99,
+      owner: "example",
+      repository: "repository",
+      jobId: "17",
+    }),
+  ).resolves.toBe("failed test log");
+  expect(requests).toEqual([
+    "https://api.github.com/repos/example/repository/actions/jobs/17/logs",
+  ]);
+});
+
+it("updates the stable AgentCI Check with an Unresolved Repair explanation", async () => {
+  const privateKey = generateKeyPairSync("rsa", {
+    modulusLength: 1024,
+    privateKeyEncoding: { format: "pem", type: "pkcs8" },
+    publicKeyEncoding: { format: "pem", type: "spki" },
+  }).privateKey;
+  let patched: { url: string; body: unknown } | undefined;
+  const api = createGitHubAppIntakeApi({
+    appId: "12345",
+    privateKey,
+    fetch: async (input, init) => {
+      const url = String(input);
+      if (url.endsWith("/app/installations/99/access_tokens")) {
+        return Response.json({ token: "installation-token" });
+      }
+      if (init?.method === "PATCH") {
+        patched = { url, body: JSON.parse(String(init.body)) };
+        return Response.json({ id: 55 });
+      }
+      return Response.json({
+        check_runs: [{ id: 55, external_id: "agentci-repair-attempt-1", app: { id: 12345 } }],
+      });
+    },
+  });
+
+  await api.updateCheck?.({
+    installationId: 99,
+    owner: "example",
+    repository: "repository",
+    revision: "0123456789abcdef0123456789abcdef01234567",
+    externalId: "agentci-repair-attempt-1",
+    status: "completed",
+    conclusion: "neutral",
+    title: "AgentCI could not identify an actionable Primary Failure",
+    summary: "Unresolved Repair: No failed step could be identified safely.",
+  });
+
+  expect(patched).toEqual({
+    url: "https://api.github.com/repos/example/repository/check-runs/55",
+    body: {
+      status: "completed",
+      conclusion: "neutral",
+      output: {
+        title: "AgentCI could not identify an actionable Primary Failure",
+        summary: "Unresolved Repair: No failed step could be identified safely.",
+      },
+    },
+  });
 });
