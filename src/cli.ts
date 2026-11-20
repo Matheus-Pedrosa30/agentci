@@ -1,20 +1,55 @@
 #!/usr/bin/env node
 
 import { spawnSync } from "node:child_process";
-import { accessSync, constants } from "node:fs";
+import { createPrivateKey } from "node:crypto";
+import { accessSync, constants, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
-interface OperatorConfig {
-  database: { path: string };
-  github: {
-    appIdEnv: string;
-    privateKeyEnv: string;
-    webhookSecretEnv: string;
-  };
-  providers: Record<string, { type: string; apiKeyEnv: string }>;
-  models: Record<string, { provider: string; model: string }>;
-  runtimes: Record<string, { image: string }>;
+type UnknownRecord = Record<string, unknown>;
+
+function record(value: unknown): UnknownRecord {
+  return typeof value === "object" && value !== null && !Array.isArray(value)
+    ? (value as UnknownRecord)
+    : {};
+}
+
+function environmentVariableName(value: unknown): string | undefined {
+  return typeof value === "string" && /^[A-Z_][A-Z\d_]*$/u.test(value) ? value : undefined;
+}
+
+function aliasName(value: string): boolean {
+  return /^[a-z][a-z\d-]*$/u.test(value);
+}
+
+function isPrivateKey(value: string): boolean {
+  try {
+    createPrivateKey(value);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function configuredEnvironmentValue(
+  configuredName: unknown,
+  invalidNameProblem: string,
+  missingProblem: string,
+  problems: string[],
+): string | undefined {
+  const name = environmentVariableName(configuredName);
+  if (!name) {
+    problems.push(invalidNameProblem);
+    return undefined;
+  }
+
+  const value = process.env[name];
+  if (!value) {
+    problems.push(missingProblem);
+    return undefined;
+  }
+
+  return value;
 }
 
 function configPath(arguments_: string[]): string {
@@ -24,9 +59,14 @@ function configPath(arguments_: string[]): string {
 
 async function doctor(arguments_: string[]): Promise<number> {
   const loaded = (await import(pathToFileURL(configPath(arguments_)).href)) as {
-    default: OperatorConfig;
+    default: unknown;
   };
-  const config = loaded.default;
+  const config = record(loaded.default);
+  const database = record(config.database);
+  const github = record(config.github);
+  const providers = record(config.providers);
+  const models = record(config.models);
+  const runtimes = record(config.runtimes);
   const problems: string[] = [];
 
   const docker =
@@ -37,47 +77,95 @@ async function doctor(arguments_: string[]): Promise<number> {
     problems.push("Docker daemon is unavailable.");
   }
 
-  try {
-    accessSync(dirname(config.database.path), constants.W_OK);
-  } catch {
-    problems.push("SQLite directory is not writable.");
+  if (typeof database.path !== "string" || database.path.length === 0) {
+    problems.push("SQLite path is missing or invalid.");
+  } else {
+    try {
+      const databaseFile = statSync(database.path);
+      if (!databaseFile.isFile()) {
+        problems.push("SQLite path is not a writable file.");
+      } else {
+        accessSync(database.path, constants.R_OK | constants.W_OK);
+      }
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        try {
+          accessSync(dirname(database.path), constants.W_OK);
+        } catch {
+          problems.push("SQLite directory is not writable.");
+        }
+      } else {
+        problems.push("SQLite path is not a writable file.");
+      }
+    }
   }
 
-  const githubCredentials: Array<[string, string]> = [
-    [config.github.appIdEnv, "GitHub App ID environment variable is missing."],
-    [config.github.privateKeyEnv, "GitHub App private key environment variable is missing."],
-    [config.github.webhookSecretEnv, "GitHub webhook secret environment variable is missing."],
-  ];
-  for (const [name, problem] of githubCredentials) {
-    if (!process.env[name]) problems.push(problem);
+  const appId = configuredEnvironmentValue(
+    github.appIdEnv,
+    "GitHub App ID environment variable name is invalid.",
+    "GitHub App ID environment variable is missing.",
+    problems,
+  );
+  if (appId && !/^[1-9]\d*$/u.test(appId)) {
+    problems.push("GitHub App ID is invalid.");
   }
+  const privateKey = configuredEnvironmentValue(
+    github.privateKeyEnv,
+    "GitHub App private key environment variable name is invalid.",
+    "GitHub App private key environment variable is missing.",
+    problems,
+  );
+  if (privateKey && !isPrivateKey(privateKey)) {
+    problems.push("GitHub App private key is invalid.");
+  }
+  configuredEnvironmentValue(
+    github.webhookSecretEnv,
+    "GitHub webhook secret environment variable name is invalid.",
+    "GitHub webhook secret environment variable is missing.",
+    problems,
+  );
 
-  if (Object.keys(config.providers).length === 0) {
+  if (Object.keys(providers).length === 0) {
     problems.push("At least one provider alias is required.");
   }
-  for (const [alias, provider] of Object.entries(config.providers)) {
-    if (!process.env[provider.apiKeyEnv]) {
-      problems.push(
-        `Provider alias ${JSON.stringify(alias)} has a missing credential environment variable.`,
-      );
+  for (const [alias, providerValue] of Object.entries(providers)) {
+    const provider = record(providerValue);
+    if (!aliasName(alias)) {
+      problems.push("A provider alias is invalid.");
+    }
+    if (provider.type !== "openai") {
+      problems.push("A provider type is invalid.");
+    }
+    const apiKeyEnv = environmentVariableName(provider.apiKeyEnv);
+    if (!apiKeyEnv || !process.env[apiKeyEnv]) {
+      problems.push("A provider has a missing credential environment variable.");
     }
   }
-  if (Object.keys(config.models).length === 0) {
+  if (Object.keys(models).length === 0) {
     problems.push("At least one model alias is required.");
   }
-  for (const [alias, model] of Object.entries(config.models)) {
-    if (!config.providers[model.provider]) {
-      problems.push(`Model alias ${JSON.stringify(alias)} references an unknown provider.`);
+  for (const [alias, modelValue] of Object.entries(models)) {
+    const model = record(modelValue);
+    if (!aliasName(alias)) {
+      problems.push("A model alias is invalid.");
+    }
+    if (typeof model.model !== "string" || model.model.trim().length === 0) {
+      problems.push("A model identifier is invalid.");
+    }
+    if (typeof model.provider !== "string" || !providers[model.provider]) {
+      problems.push("A model references an unknown provider.");
     }
   }
-  if (Object.keys(config.runtimes).length === 0) {
+  if (Object.keys(runtimes).length === 0) {
     problems.push("At least one Runtime Profile alias is required.");
   }
-  for (const [alias, runtime] of Object.entries(config.runtimes)) {
-    if (!/@sha256:[a-f\d]{64}$/u.test(runtime.image)) {
-      problems.push(
-        `Runtime Profile alias ${JSON.stringify(alias)} does not use an image pinned by SHA-256 digest.`,
-      );
+  for (const [alias, runtimeValue] of Object.entries(runtimes)) {
+    const runtime = record(runtimeValue);
+    if (!aliasName(alias)) {
+      problems.push("A Runtime Profile alias is invalid.");
+    }
+    if (typeof runtime.image !== "string" || !/@sha256:[a-f\d]{64}$/u.test(runtime.image)) {
+      problems.push("A Runtime Profile does not use an image pinned by SHA-256 digest.");
     }
   }
 
