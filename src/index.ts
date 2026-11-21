@@ -16,6 +16,15 @@ export type {
   PrimaryFailureIdentification,
   RequestedFilesValidation,
 } from "./failure-evidence.ts";
+export { classifyValidation, evaluateProposal, primaryFailureIdentity } from "./proposal-policy.ts";
+export type {
+  PolicyProposal,
+  ProposalChange,
+  ProposalEvaluation,
+  ProposalUsage,
+  ValidationClassification,
+  ValidationObservation,
+} from "./proposal-policy.ts";
 export { createWebhookIntake } from "./intake.ts";
 export type {
   GitHubIntakeApi,
