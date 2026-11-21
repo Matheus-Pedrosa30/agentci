@@ -12,6 +12,7 @@ import {
   primaryFailureIdentity,
   type PolicyProposal,
 } from "./proposal-policy.ts";
+import { RepairProviderError } from "./model-provider.ts";
 
 export interface RepairProposalChange {
   path: string;
@@ -40,6 +41,10 @@ export interface RepairProvider {
     files: Readonly<Record<string, string>>;
     previousRejections: readonly string[];
   }): Promise<unknown>;
+}
+
+export interface RepairModelRegistry {
+  createRepairProvider(alias: string): RepairProvider;
 }
 
 export interface SandboxRuntime {
@@ -202,13 +207,30 @@ function auditText(value: string): string {
   return redactAndBoundSummary(value);
 }
 
-export function createRepairOrchestrator(dependencies: {
+function providerFailureReason(error: unknown, fallback: string): string {
+  if (!(error instanceof RepairProviderError)) return fallback;
+  switch (error.kind) {
+    case "provider_error":
+      return "The model provider request failed.";
+    case "quota_exceeded":
+      return "The model provider quota was exceeded.";
+    case "invalid_structured_output":
+      return "The model provider returned invalid structured output.";
+    case "missing_usage":
+      return "The model provider response omitted required usage data.";
+  }
+}
+
+type RepairOrchestratorDependencies = {
   github: GitHubPublication;
-  provider: RepairProvider;
   sandbox: SandboxRuntime;
   persistence: RepairAttemptPersistence;
   clock: RepairClock;
-}): {
+} & (
+  { provider: RepairProvider; models?: never } | { models: RepairModelRegistry; provider?: never }
+);
+
+export function createRepairOrchestrator(dependencies: RepairOrchestratorDependencies): {
   advance(
     attempt: RepairAttemptInput,
   ): Promise<
@@ -252,15 +274,24 @@ export function createRepairOrchestrator(dependencies: {
         });
         return { outcome: "unresolved" };
       };
-      if (dependencies.provider.alias !== attempt.modelAlias) {
+      let provider: RepairProvider;
+      try {
+        provider =
+          dependencies.provider ?? dependencies.models.createRepairProvider(attempt.modelAlias);
+      } catch {
+        return unresolved(
+          "The Repository Contract selected a model alias that is not allowlisted.",
+        );
+      }
+      if (provider.alias !== attempt.modelAlias) {
         return unresolved("The configured model alias does not match the selected provider.");
       }
       const evidence = buildModelEvidence(attempt.primaryFailure, attempt.allowedPaths);
       let analysisResult: unknown;
       try {
-        analysisResult = await dependencies.provider.analyzeFailure(evidence);
-      } catch {
-        return unresolved("Failure analysis could not be completed.");
+        analysisResult = await provider.analyzeFailure(evidence);
+      } catch (error) {
+        return unresolved(providerFailureReason(error, "Failure analysis could not be completed."));
       }
       const analysis = parseAnalysis(analysisResult);
       if (!analysis) return unresolved("The provider returned an invalid failure analysis.");
@@ -321,13 +352,16 @@ export function createRepairOrchestrator(dependencies: {
         });
         let proposalResult: unknown;
         try {
-          proposalResult = await dependencies.provider.proposeRepair({
+          proposalResult = await provider.proposeRepair({
             evidence,
             files,
             previousRejections: rejections,
           });
-        } catch {
-          return unresolved("Repair Proposal generation could not be completed.", audit());
+        } catch (error) {
+          return unresolved(
+            providerFailureReason(error, "Repair Proposal generation could not be completed."),
+            audit(),
+          );
         }
         proposalCount += 1;
         const evaluation = evaluateProposal({
@@ -401,7 +435,7 @@ export function createRepairOrchestrator(dependencies: {
         `Evidence: ${redactAndBoundSummary(evidence.log)}`,
         `Changed files: ${auditText(changedFiles.join(", "))}`,
         `Validation command: ${auditText(commandText(attempt.validationCommand))}`,
-        `Provider/model: ${auditText(dependencies.provider.provider)}/${auditText(dependencies.provider.model)}`,
+        `Provider/model: ${auditText(provider.provider)}/${auditText(provider.model)}`,
         `Proposal count: ${proposalCount}`,
         `Rejected proposals: ${rejections.length === 0 ? "none" : rejections.map((summary, index) => `${index + 1}. ${auditText(summary)}`).join("; ")}`,
         `Usage: Input tokens: ${inputTokens}; output tokens: ${outputTokens}`,

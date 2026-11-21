@@ -35,6 +35,25 @@ export type {
 export { parseRepositoryContract } from "./repository-contract.ts";
 export type { RepositoryContract } from "./repository-contract.ts";
 export { createRepairOrchestrator } from "./repair-orchestrator.ts";
+export {
+  createAiSdkRepairProvider,
+  createAnthropicModel,
+  createAnthropicRepairProvider,
+  createModelRegistry,
+  createOpenAICompatibleModel,
+  createOpenAICompatibleRepairProvider,
+  createOpenAIModel,
+  createOpenAIRepairProvider,
+  ModelSelectionError,
+  RepairProviderError,
+} from "./model-provider.ts";
+export type {
+  AnthropicModelOptions,
+  OpenAICompatibleModelOptions,
+  OpenAIModelOptions,
+  RegisteredModel,
+  RepairProviderErrorKind,
+} from "./model-provider.ts";
 export { createNode24DockerRuntime } from "./node24-docker-runtime.ts";
 export type {
   DockerCommandResult,
@@ -47,6 +66,7 @@ export type {
   RepairAttemptInput,
   RepairAttemptPersistence,
   RepairClock,
+  RepairModelRegistry,
   RepairProposal,
   RepairProposalChange,
   RepairProvider,
