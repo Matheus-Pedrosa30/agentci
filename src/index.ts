@@ -1,6 +1,21 @@
 export const PROJECT_NAME = "AgentCI";
 
 export { createGitHubAppIntakeApi } from "./github-api.ts";
+export { createDeterministicFailureAnalyzer } from "./failure-analyzer.ts";
+export type { FailureAnalysis, FailureAnalyzer } from "./failure-analyzer.ts";
+export {
+  buildModelEvidence,
+  identifyPrimaryFailure,
+  validateAllowedFilePatterns,
+  validateRequestedFiles,
+} from "./failure-evidence.ts";
+export type {
+  ConfiguredJobEvidence,
+  ModelFailureEvidence,
+  PrimaryFailure,
+  PrimaryFailureIdentification,
+  RequestedFilesValidation,
+} from "./failure-evidence.ts";
 export { createWebhookIntake } from "./intake.ts";
 export type {
   GitHubIntakeApi,
