@@ -55,6 +55,7 @@ export interface SandboxRuntime {
     | { outcome: "passed"; changedFiles: readonly string[] }
     | { outcome: "failed"; summary: string; observedFailureIdentity?: string }
   >;
+  cleanup?(input: { attemptId: string }): Promise<void>;
 }
 
 interface PublicationReport {
@@ -84,9 +85,13 @@ export interface GitHubPublication {
 export interface RepairAttemptPersistence {
   transition(input: {
     attemptId: string;
-    status: "proposing" | "validating" | "publishing" | "validated" | "unresolved";
+    status: "proposing" | "validating" | "publishing" | "validated" | "unresolved" | "stale";
     at: string;
   }): Promise<void>;
+  publishIfCurrent<T>(
+    input: { attemptId: string; at: string },
+    publish: () => Promise<T>,
+  ): Promise<{ outcome: "published"; value: T } | { outcome: "stale" }>;
 }
 
 export interface RepairClock {
@@ -206,7 +211,11 @@ export function createRepairOrchestrator(dependencies: {
 }): {
   advance(
     attempt: RepairAttemptInput,
-  ): Promise<{ outcome: "validated"; pullRequestNumber: number } | { outcome: "unresolved" }>;
+  ): Promise<
+    | { outcome: "validated"; pullRequestNumber: number }
+    | { outcome: "unresolved" }
+    | { outcome: "stale" }
+  >;
 } {
   const at = () => dependencies.clock.now().toISOString();
   return {
@@ -353,6 +362,10 @@ export function createRepairOrchestrator(dependencies: {
           });
         } catch {
           return unresolved("Sandbox validation could not be completed.", audit());
+        } finally {
+          if (dependencies.sandbox.cleanup) {
+            await dependencies.sandbox.cleanup({ attemptId: attempt.attemptId });
+          }
         }
         const validation = parseValidation(validationResult);
         if (!validation) {
@@ -402,16 +415,31 @@ export function createRepairOrchestrator(dependencies: {
         status: "publishing",
         at: at(),
       });
-      const publication = await dependencies.github.ensureValidatedRepair({
-        repository: attempt.repository,
-        revision: attempt.revision,
-        baseBranch: attempt.defaultBranch,
-        headBranch,
-        draft: true,
-        changes: proposal.changes,
-        title: `Validated Repair for workflow run ${attempt.runId}`,
-        body: report,
-      });
+      const guardedPublication = await dependencies.persistence.publishIfCurrent(
+        { attemptId: attempt.attemptId, at: at() },
+        () =>
+          dependencies.github.ensureValidatedRepair({
+            repository: attempt.repository,
+            revision: attempt.revision,
+            baseBranch: attempt.defaultBranch,
+            headBranch,
+            draft: true,
+            changes: proposal.changes,
+            title: `Validated Repair for workflow run ${attempt.runId}`,
+            body: report,
+          }),
+      );
+      if (guardedPublication.outcome === "stale") {
+        await dependencies.github.completeCheck({
+          repository: attempt.repository,
+          revision: attempt.revision,
+          conclusion: "neutral",
+          title: "AgentCI stopped a Stale Repair",
+          body: "Stale Repair: A newer eligible workflow run superseded this Repair Attempt.",
+        });
+        return { outcome: "stale" };
+      }
+      const publication = guardedPublication.value;
       await dependencies.persistence.transition({
         attemptId: attempt.attemptId,
         status: "validated",
