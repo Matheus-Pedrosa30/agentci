@@ -28,6 +28,7 @@ Create a trusted local `agentci.config.ts` file outside repositories being repai
 ```ts
 export default {
   database: { path: "/var/lib/agentci/agentci.sqlite" },
+  server: { host: "127.0.0.1", port: 3000 },
   github: {
     appIdEnv: "AGENTCI_GITHUB_APP_ID",
     privateKeyEnv: "AGENTCI_GITHUB_PRIVATE_KEY",
@@ -53,6 +54,28 @@ agentci doctor
 ```
 
 Use `agentci doctor --config /trusted/path/agentci.config.ts` to select another trusted config file. The command checks Docker, the SQLite location, GitHub App credential variables, provider and model aliases, and Runtime Profile image pins. It reports all detected problems together and exits nonzero unless the environment is ready.
+
+## Webhook intake
+
+After `agentci doctor` succeeds, start the local service with `agentci start` (or pass the same `--config` option used for `doctor`). The service exposes `GET /health` and accepts GitHub App `workflow_run` deliveries at `POST /github/webhook`. Configure the GitHub App with the same webhook secret named by the trusted configuration.
+
+Eligible repositories opt in with `.agentci.json` at the failed workflow revision:
+
+```json
+{
+  "version": 1,
+  "workflow": "CI",
+  "job": "test",
+  "branches": ["main"],
+  "model": "repair",
+  "runtime": "node-24",
+  "install": ["npm", "ci", "--ignore-scripts"],
+  "test": ["npm", "test"],
+  "allowedPaths": ["src/**", "test/**"]
+}
+```
+
+Model and Runtime Profile names are aliases into trusted local configuration; repository input cannot select credentials, endpoints, or images directly. Signed eligible failures are queued durably in SQLite, processed serially, and receive one initial AgentCI Check. Raw webhook bodies and Repository Contract contents are not retained.
 
 ## Security
 

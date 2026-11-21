@@ -336,3 +336,62 @@ describe("agentci doctor", () => {
     expect(result.stderr).toContain("SQLite path is not a writable file.");
   });
 });
+
+describe("agentci start", () => {
+  it("loads the source command and rejects incomplete trusted configuration", () => {
+    const directory = mkdtempSync(join(tmpdir(), "agentci-start-cli-"));
+    const config = join(directory, "agentci.config.mjs");
+    writeFileSync(config, "export default {};\n");
+
+    const result = spawnSync(
+      process.execPath,
+      [resolve("src/cli.ts"), "start", "--config", config],
+      { encoding: "utf8" },
+    );
+
+    expect({ status: result.status, stdout: result.stdout, stderr: result.stderr }).toEqual({
+      status: 1,
+      stdout: "",
+      stderr: "AgentCI failed to start: trusted configuration is incomplete.\n",
+    });
+  });
+
+  it("rejects unvalidated model and Runtime Profile aliases", () => {
+    const directory = mkdtempSync(join(tmpdir(), "agentci-start-cli-"));
+    const config = join(directory, "agentci.config.mjs");
+    writeFileSync(
+      config,
+      `export default {
+        database: { path: ${JSON.stringify(join(directory, "agentci.sqlite"))} },
+        github: {
+          appIdEnv: "START_APP_ID",
+          privateKeyEnv: "START_PRIVATE_KEY",
+          webhookSecretEnv: "START_WEBHOOK_SECRET"
+        },
+        providers: {},
+        models: { repair: { provider: "missing", model: "repair-model" } },
+        runtimes: { "node-24": { image: "node:24" } }
+      };\n`,
+    );
+
+    const result = spawnSync(
+      process.execPath,
+      [resolve("src/cli.ts"), "start", "--config", config],
+      {
+        encoding: "utf8",
+        env: {
+          ...process.env,
+          START_APP_ID: "12345",
+          START_PRIVATE_KEY: TEST_PRIVATE_KEY,
+          START_WEBHOOK_SECRET: "configured",
+        },
+      },
+    );
+
+    expect({ status: result.status, stdout: result.stdout, stderr: result.stderr }).toEqual({
+      status: 1,
+      stdout: "",
+      stderr: "AgentCI failed to start: trusted configuration is incomplete.\n",
+    });
+  });
+});

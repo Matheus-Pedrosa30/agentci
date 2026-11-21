@@ -6,6 +6,8 @@ import { accessSync, constants, statSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 
+type GitHubIntakeApi = import("./intake.ts").GitHubIntakeApi;
+
 type UnknownRecord = Record<string, unknown>;
 
 function record(value: unknown): UnknownRecord {
@@ -180,14 +182,123 @@ async function doctor(arguments_: string[]): Promise<number> {
   return 0;
 }
 
-async function main(): Promise<number> {
-  const [command, ...arguments_] = process.argv.slice(2);
-  if (command !== "doctor") {
-    process.stderr.write("Usage: agentci doctor [--config <path>]\n");
-    return 2;
+function githubIntakeApi(value: unknown): GitHubIntakeApi | undefined {
+  const api = record(value);
+  return typeof api.getRepositoryContract === "function" &&
+    typeof api.getWorkflowJobs === "function" &&
+    typeof api.ensureInitialCheck === "function"
+    ? (api as unknown as GitHubIntakeApi)
+    : undefined;
+}
+
+function intakeAliases(
+  providers: UnknownRecord,
+  models: UnknownRecord,
+  runtimes: UnknownRecord,
+): { models: string[]; runtimes: string[] } | undefined {
+  const modelAliases = Object.entries(models);
+  const runtimeAliases = Object.entries(runtimes);
+  if (modelAliases.length === 0 || runtimeAliases.length === 0) return undefined;
+  if (
+    modelAliases.some(([alias, value]) => {
+      const model = record(value);
+      return (
+        !aliasName(alias) ||
+        typeof model.model !== "string" ||
+        model.model.trim().length === 0 ||
+        typeof model.provider !== "string" ||
+        !providers[model.provider]
+      );
+    }) ||
+    runtimeAliases.some(([alias, value]) => {
+      const runtime = record(value);
+      return (
+        !aliasName(alias) ||
+        typeof runtime.image !== "string" ||
+        !/@sha256:[a-f\d]{64}$/u.test(runtime.image)
+      );
+    })
+  ) {
+    return undefined;
+  }
+  return {
+    models: modelAliases.map(([alias]) => alias),
+    runtimes: runtimeAliases.map(([alias]) => alias),
+  };
+}
+
+async function start(arguments_: string[]): Promise<number> {
+  const [{ startAgentCiService }, { createGitHubAppIntakeApi }] = await Promise.all([
+    import("./start.ts"),
+    import("./github-api.ts"),
+  ]);
+  const loaded = (await import(pathToFileURL(configPath(arguments_)).href)) as { default: unknown };
+  const config = record(loaded.default);
+  const database = record(config.database);
+  const github = record(config.github);
+  const server = record(config.server);
+  const providers = record(config.providers);
+  const models = record(config.models);
+  const runtimes = record(config.runtimes);
+  const aliases = intakeAliases(providers, models, runtimes);
+  const secretName = environmentVariableName(github.webhookSecretEnv);
+  const secret = secretName ? process.env[secretName] : undefined;
+  const appIdName = environmentVariableName(github.appIdEnv);
+  const privateKeyName = environmentVariableName(github.privateKeyEnv);
+  const appId = appIdName ? process.env[appIdName] : undefined;
+  const privateKey = privateKeyName ? process.env[privateKeyName] : undefined;
+  const configuredApi = githubIntakeApi(github.intakeApi);
+  const validNativeCredentials =
+    appId && /^[1-9]\d*$/u.test(appId) && privateKey && isPrivateKey(privateKey);
+  const api =
+    configuredApi ??
+    (validNativeCredentials
+      ? createGitHubAppIntakeApi({
+          appId,
+          privateKey,
+          ...(typeof github.apiUrl === "string" ? { apiUrl: github.apiUrl } : {}),
+        })
+      : undefined);
+  if (
+    typeof database.path !== "string" ||
+    !secret ||
+    !api ||
+    !aliases ||
+    (server.host !== undefined && typeof server.host !== "string") ||
+    (server.port !== undefined && typeof server.port !== "number")
+  ) {
+    process.stderr.write("AgentCI failed to start: trusted configuration is incomplete.\n");
+    return 1;
   }
 
-  return doctor(arguments_);
+  const service = await startAgentCiService({
+    databasePath: database.path,
+    webhookSecret: secret,
+    aliases,
+    github: api,
+    host: typeof server.host === "string" ? server.host : "127.0.0.1",
+    port: typeof server.port === "number" ? server.port : 3000,
+  });
+  process.stdout.write(`AgentCI listening at ${service.url}.\n`);
+  await new Promise<void>((resolve) => {
+    const stop = () => resolve();
+    process.once("SIGINT", stop);
+    process.once("SIGTERM", stop);
+  });
+  await service.close();
+  return 0;
+}
+
+async function main(): Promise<number> {
+  const [command, ...arguments_] = process.argv.slice(2);
+  if (command === "doctor") {
+    return doctor(arguments_);
+  }
+  if (command === "start") {
+    return start(arguments_);
+  }
+  process.stderr.write("Usage: agentci <doctor|start> [--config <path>]\n");
+  return 2;
 }
 
 void main().then(
@@ -195,7 +306,11 @@ void main().then(
     process.exitCode = status;
   },
   () => {
-    process.stderr.write("AgentCI environment is not ready.\n");
+    process.stderr.write(
+      process.argv[2] === "doctor"
+        ? "AgentCI environment is not ready.\n"
+        : "AgentCI command failed.\n",
+    );
     process.exitCode = 1;
   },
 );

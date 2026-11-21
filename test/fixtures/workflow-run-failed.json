@@ -1,0 +1,17 @@
+{
+  "action": "completed",
+  "installation": {
+    "id": 99
+  },
+  "repository": {
+    "full_name": "example/repository"
+  },
+  "workflow_run": {
+    "id": 4242,
+    "name": "CI",
+    "status": "completed",
+    "conclusion": "failure",
+    "head_branch": "main",
+    "head_sha": "0123456789abcdef0123456789abcdef01234567"
+  }
+}
