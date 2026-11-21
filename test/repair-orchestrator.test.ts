@@ -3,6 +3,13 @@ import { expect, it } from "vitest";
 import { createRepairOrchestrator } from "../src/repair-orchestrator.js";
 import { primaryFailureIdentity } from "../src/proposal-policy.js";
 
+async function publishCurrent<T>(
+  _input: { attemptId: string; at: string },
+  publish: () => Promise<T>,
+) {
+  return { outcome: "published" as const, value: await publish() };
+}
+
 it("publishes one validated Repair Proposal as a Draft Repair PR through fake boundaries", async () => {
   const calls: { kind: string; value: unknown }[] = [];
   const transitions: unknown[] = [];
@@ -59,6 +66,7 @@ it("publishes one validated Repair Proposal as a Draft Repair PR through fake bo
       },
     },
     persistence: {
+      publishIfCurrent: publishCurrent,
       async transition(input) {
         transitions.push(input);
       },
@@ -202,6 +210,7 @@ it.each([
       },
     },
     persistence: {
+      publishIfCurrent: publishCurrent,
       async transition(input) {
         transitions.push(input);
       },
@@ -287,6 +296,7 @@ it("does not publish when the fake sandbox rejects the Repair Proposal", async (
       },
     },
     persistence: {
+      publishIfCurrent: publishCurrent,
       async transition(input) {
         transitions.push(input);
       },
@@ -371,6 +381,7 @@ it.each([
       },
     },
     persistence: {
+      publishIfCurrent: publishCurrent,
       async transition(input) {
         transitions.push(input);
       },
@@ -442,6 +453,7 @@ it("rejects a passing sandbox result that reports different changed files", asyn
       },
     },
     persistence: {
+      publishIfCurrent: publishCurrent,
       async transition(input) {
         statuses.push(input.status);
       },
@@ -508,7 +520,7 @@ it("refuses a proposal containing credential-like content before mutation or pub
         return { outcome: "passed", changedFiles: ["src/math.ts"] };
       },
     },
-    persistence: { async transition() {} },
+    persistence: { async transition() {}, publishIfCurrent: publishCurrent },
     clock: { now: () => new Date("2026-11-20T12:00:00.000Z") },
   });
 
@@ -568,7 +580,7 @@ it("never publishes a repair branch over the default branch", async () => {
         return { outcome: "passed", changedFiles: ["src/math.ts"] };
       },
     },
-    persistence: { async transition() {} },
+    persistence: { async transition() {}, publishIfCurrent: publishCurrent },
     clock: { now: () => new Date("2026-11-20T12:00:00.000Z") },
   });
 
@@ -654,7 +666,7 @@ it("tries at most three proposals for the same Primary Failure and reports bound
         } as const;
       },
     },
-    persistence: { async transition() {} },
+    persistence: { async transition() {}, publishIfCurrent: publishCurrent },
     clock: { now: () => new Date("2026-11-20T12:00:00.000Z") },
   });
 
@@ -739,7 +751,7 @@ it("stops after one proposal when validation reveals a different Primary Failure
         } as const;
       },
     },
-    persistence: { async transition() {} },
+    persistence: { async transition() {}, publishIfCurrent: publishCurrent },
     clock: { now: () => new Date("2026-11-20T12:00:00.000Z") },
   });
 
@@ -764,4 +776,104 @@ it("stops after one proposal when validation reveals a different Primary Failure
   });
 
   expect({ proposals, validations }).toEqual({ proposals: 1, validations: 1 });
+});
+
+it("cleans up bounded retries and cannot publish after the attempt becomes stale", async () => {
+  const events: string[] = [];
+  const identity = primaryFailureIdentity({
+    revision: "stale123",
+    workflow: "",
+    jobId: "17",
+    stepNumber: 2,
+    evidence: "expected 2, received 1",
+  });
+  let proposalNumber = 0;
+  const orchestrator = createRepairOrchestrator({
+    github: {
+      async readTrackedTextFiles() {
+        return { "src/math.ts": "export const value = 1;\n" };
+      },
+      async ensureValidatedRepair() {
+        events.push("publish");
+        return { number: 1, url: "https://example.invalid/pull/1" };
+      },
+      async completeCheck(input) {
+        events.push(`check:${input.title}`);
+      },
+    },
+    provider: {
+      alias: "repair",
+      provider: "fake-provider",
+      model: "fake-model",
+      async analyzeFailure() {
+        return { actionable: true, summary: "bad value", requestedFiles: ["src/math.ts"] };
+      },
+      async proposeRepair() {
+        proposalNumber += 1;
+        events.push(`propose-${proposalNumber}`);
+        return {
+          summary: "change value",
+          changes: [
+            { path: "src/math.ts", content: `export const value = ${proposalNumber + 1};\n` },
+          ],
+        };
+      },
+    },
+    sandbox: {
+      async validate() {
+        events.push(`validate-${proposalNumber}`);
+        return proposalNumber === 1
+          ? ({
+              outcome: "failed",
+              summary: "still red",
+              observedFailureIdentity: identity,
+            } as const)
+          : ({ outcome: "passed", changedFiles: ["src/math.ts"] } as const);
+      },
+      async cleanup() {
+        events.push(`cleanup-${proposalNumber}`);
+      },
+    },
+    persistence: {
+      async transition() {},
+      async publishIfCurrent() {
+        events.push("guard:stale");
+        return { outcome: "stale" } as const;
+      },
+    },
+    clock: { now: () => new Date("2026-11-20T12:00:00.000Z") },
+  });
+
+  await expect(
+    orchestrator.advance({
+      attemptId: "attempt-stale",
+      runId: "9012",
+      repository: "owner/repository",
+      revision: "stale123",
+      defaultBranch: "main",
+      modelAlias: "repair",
+      runtimeAlias: "node-24",
+      allowedPaths: ["src/**"],
+      installCommand: ["npm", "ci"],
+      validationCommand: ["npm", "test"],
+      primaryFailure: {
+        jobId: "17",
+        jobName: "test",
+        stepNumber: 2,
+        stepName: "Unit tests",
+        log: "expected 2, received 1",
+      },
+    }),
+  ).resolves.toEqual({ outcome: "stale" });
+
+  expect(events).toEqual([
+    "propose-1",
+    "validate-1",
+    "cleanup-1",
+    "propose-2",
+    "validate-2",
+    "cleanup-2",
+    "guard:stale",
+    "check:AgentCI stopped a Stale Repair",
+  ]);
 });

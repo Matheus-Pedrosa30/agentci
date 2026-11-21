@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import { DatabaseSync } from "node:sqlite";
 
 import type { FailureAnalysis, FailureAnalyzer } from "./failure-analyzer.ts";
@@ -61,7 +61,15 @@ export interface GitHubIntakeApi {
 export interface RepairAttemptMetadata {
   id: number;
   workflowRunId: string;
-  status: "queued" | "primary_failure" | "unresolved";
+  status:
+    | "queued"
+    | "primary_failure"
+    | "proposing"
+    | "validating"
+    | "publishing"
+    | "validated"
+    | "unresolved"
+    | "stale";
   repository: string;
   branch: string;
   revision: string;
@@ -109,6 +117,15 @@ export interface WebhookIntake {
   ): Promise<{ status: number; outcome: "rejected" | "ignored" | "queued" }>;
   listAttempts(): RepairAttemptMetadata[];
   workOnce(): Promise<boolean>;
+  transition(input: {
+    attemptId: string;
+    status: "proposing" | "validating" | "publishing" | "validated" | "unresolved" | "stale";
+    at: string;
+  }): Promise<void>;
+  publishIfCurrent<T>(
+    input: { attemptId: string; at: string },
+    publish: () => Promise<T>,
+  ): Promise<{ outcome: "published"; value: T } | { outcome: "stale" }>;
   close(): void;
 }
 
@@ -204,6 +221,8 @@ export function createWebhookIntake(options: IntakeOptions): WebhookIntake {
       primary_step_name TEXT,
       input_tokens INTEGER,
       output_tokens INTEGER,
+      worker_state TEXT NOT NULL DEFAULT 'available',
+      claim_token TEXT,
       created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
       updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
     );
@@ -226,6 +245,11 @@ export function createWebhookIntake(options: IntakeOptions): WebhookIntake {
     ["primary_step_name", "ALTER TABLE repair_attempts ADD COLUMN primary_step_name TEXT"],
     ["input_tokens", "ALTER TABLE repair_attempts ADD COLUMN input_tokens INTEGER"],
     ["output_tokens", "ALTER TABLE repair_attempts ADD COLUMN output_tokens INTEGER"],
+    [
+      "worker_state",
+      "ALTER TABLE repair_attempts ADD COLUMN worker_state TEXT NOT NULL DEFAULT 'available'",
+    ],
+    ["claim_token", "ALTER TABLE repair_attempts ADD COLUMN claim_token TEXT"],
     ["updated_at", "ALTER TABLE repair_attempts ADD COLUMN updated_at TEXT"],
   ] as const;
   for (const [column, sql] of migrations) {
@@ -233,6 +257,41 @@ export function createWebhookIntake(options: IntakeOptions): WebhookIntake {
   }
   if (!attemptColumns.has("updated_at")) {
     database.exec("UPDATE repair_attempts SET updated_at = created_at WHERE updated_at IS NULL");
+  }
+  database
+    .prepare(
+      `UPDATE repair_attempts
+       SET status = 'unresolved',
+           summary = 'Unresolved Repair: Repair Attempt was interrupted; partial work was discarded.',
+           worker_state = 'effect_pending', claim_token = NULL, check_status = 'pending',
+           updated_at = CURRENT_TIMESTAMP
+       WHERE worker_state = 'claimed'`,
+    )
+    .run();
+  database
+    .prepare(
+      `UPDATE repair_attempts
+       SET status = 'unresolved',
+           summary = 'Unresolved Repair: Repair Attempt was interrupted; partial work was discarded.',
+           worker_state = 'effect_pending', claim_token = NULL, check_status = 'pending',
+           updated_at = CURRENT_TIMESTAMP
+       WHERE status IN ('proposing', 'validating', 'publishing')`,
+    )
+    .run();
+
+  let exclusiveTail = Promise.resolve();
+  async function exclusively<T>(operation: () => T | Promise<T>): Promise<T> {
+    let release!: () => void;
+    const predecessor = exclusiveTail;
+    exclusiveTail = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    await predecessor;
+    try {
+      return await operation();
+    } finally {
+      release();
+    }
   }
 
   return {
@@ -284,44 +343,65 @@ export function createWebhookIntake(options: IntakeOptions): WebhookIntake {
         return { status: 422, outcome: "rejected" };
       }
 
-      database.exec("BEGIN IMMEDIATE");
-      try {
-        const deliveryInsert = database
-          .prepare(
-            "INSERT OR IGNORE INTO webhook_deliveries (delivery_id, workflow_run_id) VALUES (?, ?)",
-          )
-          .run(delivery.deliveryId, String(payload.workflow_run.id));
-        if (deliveryInsert.changes === 0) {
-          database.exec("COMMIT");
-          return { status: 202, outcome: "ignored" };
-        }
-        const attemptInsert = database
-          .prepare(
-            `INSERT OR IGNORE INTO repair_attempts
+      return exclusively(() => {
+        database.exec("BEGIN IMMEDIATE");
+        try {
+          const deliveryInsert = database
+            .prepare(
+              "INSERT OR IGNORE INTO webhook_deliveries (delivery_id, workflow_run_id) VALUES (?, ?)",
+            )
+            .run(delivery.deliveryId!, String(payload.workflow_run.id));
+          if (deliveryInsert.changes === 0) {
+            database.exec("COMMIT");
+            return { status: 202 as const, outcome: "ignored" as const };
+          }
+          const attemptInsert = database
+            .prepare(
+              `INSERT OR IGNORE INTO repair_attempts
               (workflow_run_id, status, repository, branch, revision, workflow, job,
                model_alias, runtime_alias, summary, installation_id)
              VALUES (?, 'queued', ?, ?, ?, ?, ?, ?, ?, 'Eligible failed workflow queued.', ?)`,
-          )
-          .run(
-            String(payload.workflow_run.id),
-            payload.repository.full_name,
-            payload.workflow_run.head_branch,
-            payload.workflow_run.head_sha,
-            contract.workflow,
-            contract.job,
-            contract.model,
-            contract.runtime,
-            payload.installation.id,
-          );
-        database.exec("COMMIT");
-        return {
-          status: 202,
-          outcome: attemptInsert.changes === 0 ? "ignored" : "queued",
-        };
-      } catch (error) {
-        database.exec("ROLLBACK");
-        throw error;
-      }
+            )
+            .run(
+              String(payload.workflow_run.id),
+              payload.repository.full_name,
+              payload.workflow_run.head_branch,
+              payload.workflow_run.head_sha,
+              contract.workflow,
+              contract.job,
+              contract.model,
+              contract.runtime,
+              payload.installation.id,
+            );
+          if (attemptInsert.changes === 0) {
+            database.exec("COMMIT");
+            return { status: 202 as const, outcome: "ignored" as const };
+          }
+          database
+            .prepare(
+              `UPDATE repair_attempts
+               SET status = 'stale',
+                   summary = 'Stale Repair: A newer eligible workflow run superseded this Repair Attempt.',
+                   worker_state = 'effect_pending', claim_token = NULL, check_status = 'pending',
+                   updated_at = CURRENT_TIMESTAMP
+               WHERE repository = ? AND branch = ? AND workflow_run_id <> ?
+                 AND status IN ('queued', 'primary_failure', 'proposing', 'validating', 'publishing')`,
+            )
+            .run(
+              payload.repository.full_name,
+              payload.workflow_run.head_branch,
+              String(payload.workflow_run.id),
+            );
+          database.exec("COMMIT");
+          return {
+            status: 202 as const,
+            outcome: "queued" as const,
+          };
+        } catch (error) {
+          database.exec("ROLLBACK");
+          throw error;
+        }
+      });
     },
     listAttempts() {
       return database
@@ -348,25 +428,66 @@ export function createWebhookIntake(options: IntakeOptions): WebhookIntake {
         });
     },
     async workOnce() {
-      const attempt = database
-        .prepare(
-          `SELECT id, workflow_run_id AS workflowRunId, status, repository, revision, job,
-                  summary, installation_id AS installationId
-           FROM repair_attempts WHERE check_status = 'pending' ORDER BY id LIMIT 1`,
-        )
-        .get() as
+      const claimToken = randomUUID();
+      database.exec("BEGIN IMMEDIATE");
+      let attempt:
         | {
             id: number;
             workflowRunId: string;
-            status: "queued" | "primary_failure" | "unresolved";
+            status: "queued" | "primary_failure" | "unresolved" | "stale";
             repository: string;
             revision: string;
             job: string;
             summary: string;
             installationId: number;
+            workerState: "available" | "claimed" | "effect_pending";
           }
         | undefined;
-      if (!attempt) return false;
+      try {
+        attempt = database
+          .prepare(
+            `SELECT id, workflow_run_id AS workflowRunId, status, repository, revision, job,
+                    summary, installation_id AS installationId, worker_state AS workerState
+             FROM repair_attempts
+             WHERE check_status = 'pending' AND worker_state IN ('available', 'effect_pending')
+             ORDER BY id LIMIT 1`,
+          )
+          .get() as
+          | {
+              id: number;
+              workflowRunId: string;
+              status: "queued" | "primary_failure" | "unresolved" | "stale";
+              repository: string;
+              revision: string;
+              job: string;
+              summary: string;
+              installationId: number;
+              workerState: "available" | "claimed" | "effect_pending";
+            }
+          | undefined;
+        if (!attempt) {
+          database.exec("COMMIT");
+          return false;
+        }
+        if (attempt.workerState === "available") {
+          const claimed = database
+            .prepare(
+              `UPDATE repair_attempts SET worker_state = 'claimed', claim_token = ?,
+                      updated_at = CURRENT_TIMESTAMP
+               WHERE id = ? AND worker_state = 'available' AND check_status = 'pending'`,
+            )
+            .run(claimToken, attempt.id);
+          if (claimed.changes === 0) {
+            database.exec("COMMIT");
+            return false;
+          }
+          attempt.workerState = "claimed";
+        }
+        database.exec("COMMIT");
+      } catch (error) {
+        database.exec("ROLLBACK");
+        throw error;
+      }
       const [owner, repository] = attempt.repository.split("/") as [string, string];
       await options.github.ensureInitialCheck({
         owner,
@@ -379,7 +500,7 @@ export function createWebhookIntake(options: IntakeOptions): WebhookIntake {
 
       let status = attempt.status;
       let summary = attempt.summary;
-      if (status === "queued") {
+      if (status === "queued" && attempt.workerState === "claimed") {
         const unresolved = (explanation: string) => {
           status = "unresolved";
           summary = redactAndBoundSummary(`Unresolved Repair: ${explanation}`);
@@ -387,9 +508,9 @@ export function createWebhookIntake(options: IntakeOptions): WebhookIntake {
             .prepare(
               `UPDATE repair_attempts
                SET status = 'unresolved', summary = ?, updated_at = CURRENT_TIMESTAMP
-               WHERE id = ?`,
+               WHERE id = ? AND worker_state = 'claimed' AND claim_token = ?`,
             )
-            .run(summary, attempt.id);
+            .run(summary, attempt.id, claimToken);
         };
         const jobs = await options.github.getWorkflowJobs({
           owner,
@@ -464,9 +585,10 @@ export function createWebhookIntake(options: IntakeOptions): WebhookIntake {
                 database
                   .prepare(
                     `UPDATE repair_attempts SET input_tokens = ?, output_tokens = ?,
-                            updated_at = CURRENT_TIMESTAMP WHERE id = ?`,
+                            updated_at = CURRENT_TIMESTAMP
+                     WHERE id = ? AND worker_state = 'claimed' AND claim_token = ?`,
                   )
-                  .run(inputTokens, outputTokens, attempt.id);
+                  .run(inputTokens, outputTokens, attempt.id, claimToken);
                 if (status === "queued") {
                   const requested = validateRequestedFiles(
                     analysis.requestedFiles,
@@ -487,7 +609,7 @@ export function createWebhookIntake(options: IntakeOptions): WebhookIntake {
                        SET status = 'primary_failure', summary = ?, primary_job_id = ?,
                            primary_step_number = ?, primary_step_name = ?, input_tokens = ?,
                            output_tokens = ?, updated_at = CURRENT_TIMESTAMP
-                       WHERE id = ?`,
+                       WHERE id = ? AND worker_state = 'claimed' AND claim_token = ?`,
                       )
                       .run(
                         summary,
@@ -497,6 +619,7 @@ export function createWebhookIntake(options: IntakeOptions): WebhookIntake {
                         inputTokens,
                         outputTokens,
                         attempt.id,
+                        claimToken,
                       );
                   }
                 }
@@ -506,6 +629,21 @@ export function createWebhookIntake(options: IntakeOptions): WebhookIntake {
         }
       }
 
+      if (attempt.workerState === "claimed") {
+        database
+          .prepare(
+            `UPDATE repair_attempts
+             SET worker_state = 'effect_pending', claim_token = NULL, updated_at = CURRENT_TIMESTAMP
+             WHERE id = ? AND worker_state = 'claimed' AND claim_token = ?`,
+          )
+          .run(attempt.id, claimToken);
+        const current = database
+          .prepare("SELECT status, summary FROM repair_attempts WHERE id = ?")
+          .get(attempt.id) as { status: typeof status; summary: string };
+        status = current.status;
+        summary = current.summary;
+      }
+
       if (options.github.updateCheck) {
         await options.github.updateCheck({
           owner,
@@ -513,21 +651,73 @@ export function createWebhookIntake(options: IntakeOptions): WebhookIntake {
           installationId: attempt.installationId,
           revision: attempt.revision,
           externalId: `agentci-repair-attempt-${attempt.id}`,
-          status: status === "unresolved" ? "completed" : "in_progress",
-          ...(status === "unresolved" ? { conclusion: "neutral" as const } : {}),
+          status: status === "unresolved" || status === "stale" ? "completed" : "in_progress",
+          ...(status === "unresolved" || status === "stale"
+            ? { conclusion: "neutral" as const }
+            : {}),
           title:
-            status === "unresolved"
-              ? "AgentCI could not identify an actionable Primary Failure"
-              : "AgentCI identified a Primary Failure",
+            status === "stale"
+              ? "AgentCI stopped a Stale Repair"
+              : status === "unresolved"
+                ? "AgentCI could not identify an actionable Primary Failure"
+                : "AgentCI identified a Primary Failure",
           summary,
         });
       }
       database
         .prepare(
-          "UPDATE repair_attempts SET check_status = 'reported', updated_at = CURRENT_TIMESTAMP WHERE id = ?",
+          `UPDATE repair_attempts
+           SET check_status = 'reported', worker_state = 'done', updated_at = CURRENT_TIMESTAMP
+           WHERE id = ? AND worker_state = 'effect_pending'`,
         )
         .run(attempt.id);
       return true;
+    },
+    async transition(input) {
+      const result = database
+        .prepare(
+          `UPDATE repair_attempts SET status = ?, updated_at = ?
+           WHERE id = ? AND status NOT IN ('stale', 'validated', 'unresolved')`,
+        )
+        .run(input.status, input.at, input.attemptId);
+      if (result.changes === 0 && input.status === "validated") {
+        database
+          .prepare(
+            "UPDATE repair_attempts SET updated_at = ? WHERE id = ? AND status = 'validated'",
+          )
+          .run(input.at, input.attemptId);
+      }
+    },
+    async publishIfCurrent(input, publish) {
+      return exclusively(async () => {
+        database.exec("BEGIN IMMEDIATE");
+        try {
+          const current = database
+            .prepare(
+              `SELECT id FROM repair_attempts AS candidate
+               WHERE candidate.id = ? AND candidate.status = 'publishing'
+                 AND NOT EXISTS (
+                   SELECT 1 FROM repair_attempts AS newer
+                   WHERE newer.repository = candidate.repository
+                     AND newer.branch = candidate.branch AND newer.id > candidate.id
+                 )`,
+            )
+            .get(input.attemptId);
+          database.exec("COMMIT");
+          if (!current) return { outcome: "stale" as const };
+        } catch (error) {
+          database.exec("ROLLBACK");
+          throw error;
+        }
+        const value = await publish();
+        database
+          .prepare(
+            `UPDATE repair_attempts SET status = 'validated', updated_at = ?
+             WHERE id = ? AND status = 'publishing'`,
+          )
+          .run(input.at, input.attemptId);
+        return { outcome: "published" as const, value };
+      });
     },
     close() {
       database.close();

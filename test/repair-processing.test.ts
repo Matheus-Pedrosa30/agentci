@@ -424,3 +424,365 @@ it("reconciles a persisted Primary Failure Check after restart without another m
   expect(updateCalls).toBe(2);
   restarted.close();
 });
+
+it("lets only one worker claim a queued Repair Attempt", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "agentci-primary-failure-"));
+  let analysisCalls = 0;
+  let releaseInitialCheck!: () => void;
+  const initialCheckBlocked = new Promise<void>((resolve) => {
+    releaseInitialCheck = resolve;
+  });
+  const intake = createWebhookIntake({
+    databasePath: join(directory, "agentci.sqlite"),
+    webhookSecret: "test-webhook-secret",
+    aliases: { models: ["repair"], runtimes: ["node-24"] },
+    github: {
+      async getRepositoryContract() {
+        return contract;
+      },
+      async getWorkflowJobs() {
+        return [
+          {
+            id: "17",
+            name: "test",
+            conclusion: "failure",
+            steps: [{ number: 1, name: "Tests", conclusion: "failure" }],
+          },
+        ];
+      },
+      async getWorkflowJobLog() {
+        return "test failed";
+      },
+      async ensureInitialCheck() {
+        await initialCheckBlocked;
+      },
+      async updateCheck() {},
+    },
+    analyzer: {
+      async analyzeFailure() {
+        analysisCalls += 1;
+        return {
+          actionable: true,
+          summary: "A deterministic failure.",
+          requestedFiles: ["src/a.ts"],
+        };
+      },
+    },
+  });
+  const signature = `sha256=${createHmac("sha256", "test-webhook-secret").update(payload).digest("hex")}`;
+  await intake.receive({
+    event: "workflow_run",
+    deliveryId: "single-claim",
+    signature,
+    body: payload,
+  });
+
+  const first = intake.workOnce();
+  const second = intake.workOnce();
+  releaseInitialCheck();
+
+  await expect(Promise.all([first, second])).resolves.toEqual([true, false]);
+  expect(analysisCalls).toBe(1);
+  intake.close();
+});
+
+it("turns an interrupted in-progress Repair Attempt into a terminal Unresolved Repair after restart", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "agentci-primary-failure-"));
+  const databasePath = join(directory, "agentci.sqlite");
+  let analysisCalls = 0;
+  const baseOptions = {
+    databasePath,
+    webhookSecret: "test-webhook-secret",
+    aliases: { models: ["repair"], runtimes: ["node-24"] },
+    analyzer: {
+      async analyzeFailure() {
+        analysisCalls += 1;
+        return { actionable: true, summary: "failure", requestedFiles: ["src/a.ts"] };
+      },
+    },
+  };
+  const first = createWebhookIntake({
+    ...baseOptions,
+    github: {
+      async getRepositoryContract() {
+        return contract;
+      },
+      async getWorkflowJobs() {
+        return [
+          {
+            id: "17",
+            name: "test",
+            conclusion: "failure",
+            steps: [{ number: 1, name: "Tests", conclusion: "failure" }],
+          },
+        ];
+      },
+      async ensureInitialCheck() {
+        throw new Error("process stopped during claimed work");
+      },
+    },
+  });
+  const signature = `sha256=${createHmac("sha256", "test-webhook-secret").update(payload).digest("hex")}`;
+  await first.receive({
+    event: "workflow_run",
+    deliveryId: "interrupted-attempt",
+    signature,
+    body: payload,
+  });
+  await expect(first.workOnce()).rejects.toThrow("process stopped during claimed work");
+  first.close();
+
+  const checks: unknown[] = [];
+  const restarted = createWebhookIntake({
+    ...baseOptions,
+    github: {
+      async getRepositoryContract() {
+        throw new Error("interrupted work must not be resumed");
+      },
+      async getWorkflowJobs() {
+        throw new Error("interrupted work must not be resumed");
+      },
+      async ensureInitialCheck() {},
+      async updateCheck(input) {
+        checks.push(input);
+      },
+    },
+  });
+
+  await expect(restarted.workOnce()).resolves.toBe(true);
+  expect(restarted.listAttempts()).toEqual([
+    expect.objectContaining({
+      status: "unresolved",
+      summary: "Unresolved Repair: Repair Attempt was interrupted; partial work was discarded.",
+    }),
+  ]);
+  expect(analysisCalls).toBe(0);
+  expect(checks).toEqual([expect.objectContaining({ status: "completed", conclusion: "neutral" })]);
+  restarted.close();
+});
+
+it("makes an older same-branch Repair Attempt stale when a newer eligible run arrives", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "agentci-primary-failure-"));
+  const checks: unknown[] = [];
+  let analysisCalls = 0;
+  const intake = createWebhookIntake({
+    databasePath: join(directory, "agentci.sqlite"),
+    webhookSecret: "test-webhook-secret",
+    aliases: { models: ["repair"], runtimes: ["node-24"] },
+    github: {
+      async getRepositoryContract() {
+        return contract;
+      },
+      async getWorkflowJobs() {
+        return [
+          {
+            id: "17",
+            name: "test",
+            conclusion: "failure",
+            steps: [{ number: 1, name: "Tests", conclusion: "failure" }],
+          },
+        ];
+      },
+      async getWorkflowJobLog() {
+        return "test failed";
+      },
+      async ensureInitialCheck() {},
+      async updateCheck(input) {
+        checks.push(input);
+      },
+    },
+    analyzer: {
+      async analyzeFailure() {
+        analysisCalls += 1;
+        return { actionable: true, summary: "failure", requestedFiles: ["src/a.ts"] };
+      },
+    },
+  });
+  const workflowPayload = JSON.parse(payload.toString("utf8")) as {
+    workflow_run: { id: number; head_sha: string };
+  };
+  const delivery = async (runId: number, revision: string) => {
+    const body = Buffer.from(
+      JSON.stringify({
+        ...workflowPayload,
+        workflow_run: { ...workflowPayload.workflow_run, id: runId, head_sha: revision },
+      }),
+    );
+    return intake.receive({
+      event: "workflow_run",
+      deliveryId: `delivery-${runId}`,
+      signature: `sha256=${createHmac("sha256", "test-webhook-secret").update(body).digest("hex")}`,
+      body,
+    });
+  };
+
+  await expect(delivery(7001, "older-revision")).resolves.toEqual({
+    status: 202,
+    outcome: "queued",
+  });
+  await expect(delivery(7002, "newer-revision")).resolves.toEqual({
+    status: 202,
+    outcome: "queued",
+  });
+
+  expect(intake.listAttempts()).toEqual([
+    expect.objectContaining({ status: "stale", revision: "older-revision" }),
+    expect.objectContaining({ status: "queued", revision: "newer-revision" }),
+  ]);
+  await expect(intake.workOnce()).resolves.toBe(true);
+  expect(analysisCalls).toBe(0);
+  expect(checks).toEqual([
+    expect.objectContaining({
+      revision: "older-revision",
+      status: "completed",
+      conclusion: "neutral",
+      title: "AgentCI stopped a Stale Repair",
+    }),
+  ]);
+  await expect(intake.workOnce()).resolves.toBe(true);
+  expect(analysisCalls).toBe(1);
+  intake.close();
+});
+
+it("atomically refuses publication after a newer eligible same-branch run wins the race", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "agentci-primary-failure-"));
+  const intake = createWebhookIntake({
+    databasePath: join(directory, "agentci.sqlite"),
+    webhookSecret: "test-webhook-secret",
+    aliases: { models: ["repair"], runtimes: ["node-24"] },
+    github: {
+      async getRepositoryContract() {
+        return contract;
+      },
+      async getWorkflowJobs() {
+        return [{ name: "test", conclusion: "failure" }];
+      },
+      async ensureInitialCheck() {},
+    },
+  });
+  const workflowPayload = JSON.parse(payload.toString("utf8")) as {
+    workflow_run: { id: number; head_sha: string };
+  };
+  const deliver = async (runId: number) => {
+    const body = Buffer.from(
+      JSON.stringify({
+        ...workflowPayload,
+        workflow_run: {
+          ...workflowPayload.workflow_run,
+          id: runId,
+          head_sha: `revision-${runId}`,
+        },
+      }),
+    );
+    return intake.receive({
+      event: "workflow_run",
+      deliveryId: `publication-race-${runId}`,
+      signature: `sha256=${createHmac("sha256", "test-webhook-secret").update(body).digest("hex")}`,
+      body,
+    });
+  };
+  await deliver(8001);
+  await intake.transition({
+    attemptId: "1",
+    status: "publishing",
+    at: "2026-11-20T12:00:00.000Z",
+  });
+  await deliver(8002);
+  let published = false;
+
+  await expect(
+    intake.publishIfCurrent({ attemptId: "1", at: "2026-11-20T12:00:01.000Z" }, async () => {
+      published = true;
+      return { number: 1 };
+    }),
+  ).resolves.toEqual({ outcome: "stale" });
+  expect(published).toBe(false);
+  intake.close();
+});
+
+it("discards running model work when a newer eligible same-branch run supersedes it", async () => {
+  const directory = mkdtempSync(join(tmpdir(), "agentci-primary-failure-"));
+  const checks: { revision: string; title: string }[] = [];
+  let analysisStarted!: () => void;
+  let releaseAnalysis!: () => void;
+  const started = new Promise<void>((resolve) => {
+    analysisStarted = resolve;
+  });
+  const blocked = new Promise<void>((resolve) => {
+    releaseAnalysis = resolve;
+  });
+  const intake = createWebhookIntake({
+    databasePath: join(directory, "agentci.sqlite"),
+    webhookSecret: "test-webhook-secret",
+    aliases: { models: ["repair"], runtimes: ["node-24"] },
+    github: {
+      async getRepositoryContract() {
+        return contract;
+      },
+      async getWorkflowJobs() {
+        return [
+          {
+            id: "17",
+            name: "test",
+            conclusion: "failure",
+            steps: [{ number: 1, name: "Tests", conclusion: "failure" }],
+          },
+        ];
+      },
+      async getWorkflowJobLog() {
+        return "test failed";
+      },
+      async ensureInitialCheck() {},
+      async updateCheck(input) {
+        checks.push({ revision: input.revision, title: input.title });
+      },
+    },
+    analyzer: {
+      async analyzeFailure() {
+        analysisStarted();
+        await blocked;
+        return { actionable: true, summary: "old analysis", requestedFiles: ["src/a.ts"] };
+      },
+    },
+  });
+  const workflowPayload = JSON.parse(payload.toString("utf8")) as {
+    workflow_run: { id: number; head_sha: string };
+  };
+  const deliver = async (runId: number) => {
+    const body = Buffer.from(
+      JSON.stringify({
+        ...workflowPayload,
+        workflow_run: {
+          ...workflowPayload.workflow_run,
+          id: runId,
+          head_sha: `running-revision-${runId}`,
+        },
+      }),
+    );
+    return intake.receive({
+      event: "workflow_run",
+      deliveryId: `running-supersession-${runId}`,
+      signature: `sha256=${createHmac("sha256", "test-webhook-secret").update(body).digest("hex")}`,
+      body,
+    });
+  };
+
+  await deliver(8101);
+  const oldWork = intake.workOnce();
+  await started;
+  await deliver(8102);
+  releaseAnalysis();
+  await oldWork;
+
+  expect(intake.listAttempts()).toEqual([
+    expect.objectContaining({ status: "stale", revision: "running-revision-8101" }),
+    expect.objectContaining({ status: "queued", revision: "running-revision-8102" }),
+  ]);
+  expect(checks).toEqual([
+    {
+      revision: "running-revision-8101",
+      title: "AgentCI stopped a Stale Repair",
+    },
+  ]);
+  intake.close();
+});
