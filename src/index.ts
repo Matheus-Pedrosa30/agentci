@@ -26,6 +26,13 @@ export type {
 export { parseRepositoryContract } from "./repository-contract.ts";
 export type { RepositoryContract } from "./repository-contract.ts";
 export { createRepairOrchestrator } from "./repair-orchestrator.ts";
+export { createNode24DockerRuntime } from "./node24-docker-runtime.ts";
+export type {
+  DockerCommandResult,
+  DockerCommandRunner,
+  ExactRevisionArchiveProvider,
+  Node24DockerRuntimeOptions,
+} from "./node24-docker-runtime.ts";
 export type {
   GitHubPublication,
   RepairAttemptInput,

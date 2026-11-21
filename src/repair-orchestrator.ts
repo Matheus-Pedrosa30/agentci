@@ -47,6 +47,7 @@ export interface SandboxRuntime {
     installCommand: readonly string[];
     validationCommand: readonly string[];
     proposal: RepairProposal;
+    signal?: AbortSignal;
   }): Promise<
     { outcome: "passed"; changedFiles: readonly string[] } | { outcome: "failed"; summary: string }
   >;
