@@ -92,7 +92,10 @@ interface ArchiveEntry {
 
 function parseArchive(source: Buffer): ArchiveEntry[] {
   if (source.length > MAX_ARCHIVE_BYTES) throw new Error("Repository archive is too large.");
-  const bytes = source[0] === 0x1f && source[1] === 0x8b ? gunzipSync(source) : source;
+  const bytes =
+    source[0] === 0x1f && source[1] === 0x8b
+      ? gunzipSync(source, { maxOutputLength: MAX_ARCHIVE_BYTES + 1 })
+      : source;
   if (bytes.length > MAX_ARCHIVE_BYTES) throw new Error("Repository archive is too large.");
   const entries: ArchiveEntry[] = [];
   let offset = 0;
@@ -256,13 +259,19 @@ function installCommand(command: readonly string[]): string[] {
   if (
     command[0] !== "npm" ||
     command[1] !== "ci" ||
-    command.some((argument) => argument.includes("\0") || argument === "--ignore-scripts=false")
+    command.some(
+      (argument, index) =>
+        argument.includes("\0") ||
+        argument === "--" ||
+        argument === "--ignore-scripts=false" ||
+        argument === "--no-ignore-scripts" ||
+        argument === "--config.ignore-scripts=false" ||
+        (argument === "--ignore-scripts" && command[index + 1] === "false"),
+    )
   ) {
     throw new Error("Installation command is invalid.");
   }
-  return command[0] === "npm" && !command.includes("--ignore-scripts")
-    ? [...command, "--ignore-scripts"]
-    : [...command];
+  return [...command, "--ignore-scripts=true"];
 }
 
 function validationCommand(command: readonly string[]): string[] {
@@ -280,6 +289,9 @@ export function createNode24DockerRuntime(options: Node24DockerRuntimeOptions): 
       const image = options.runtimeImages[input.runtimeAlias];
       if (!image || !IMAGE_DIGEST.test(image) || !/^[a-f\d]{40}$/u.test(input.revision)) {
         return { outcome: "failed", summary: "Runtime Profile is not approved and digest-pinned." };
+      }
+      if (input.signal?.aborted) {
+        return { outcome: "failed", summary: "Sandbox validation was cancelled." };
       }
       const controller = new AbortController();
       let timedOut = false;

@@ -1,6 +1,7 @@
 import { mkdtemp, readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { gzipSync } from "node:zlib";
 import { expect, it } from "vitest";
 
 import {
@@ -88,7 +89,7 @@ it("resolves an approved digest-pinned node-24 image and uses two hardened conta
       expect(arguments_.join(" ")).not.toMatch(/TOKEN|KEY|SECRET/u);
     }
     expect(runs[0]).toEqual(
-      expect.arrayContaining(["--network", "bridge", "npm", "ci", "--ignore-scripts"]),
+      expect.arrayContaining(["--network", "bridge", "npm", "ci", "--ignore-scripts=true"]),
     );
     expect(runs[1]).toEqual(expect.arrayContaining(["--network", "none", "npm", "test"]));
     expect(await readdir(temporaryRoot)).toEqual([]);
@@ -289,10 +290,52 @@ it.each(["timeout", "cancellation"])(
   },
 );
 
+it("does not acquire source or start Docker when validation is already cancelled", async () => {
+  const external = new AbortController();
+  external.abort();
+  let archiveRequested = false;
+  let dockerInvoked = false;
+  const runtime = createNode24DockerRuntime({
+    runtimeImages: { "node-24": `node@sha256:${"a".repeat(64)}` },
+    archiveProvider: {
+      async fetchExactRevisionArchive() {
+        archiveRequested = true;
+        return Buffer.alloc(0);
+      },
+    },
+    docker: {
+      async run() {
+        dockerInvoked = true;
+        return { exitCode: 0, stdout: "", stderr: "" };
+      },
+    },
+  });
+
+  const result = await runtime.validate({
+    repository: "owner/repo",
+    revision: "1".repeat(40),
+    runtimeAlias: "node-24",
+    installCommand: ["npm", "ci"],
+    validationCommand: ["npm", "test"],
+    signal: external.signal,
+    proposal: { summary: "repair", changes: [{ path: "a.txt", content: "after" }] },
+  });
+
+  expect(result).toEqual({ outcome: "failed", summary: "Sandbox validation was cancelled." });
+  expect({ archiveRequested, dockerInvoked }).toEqual({
+    archiveRequested: false,
+    dockerInvoked: false,
+  });
+});
+
 it.each([
   ["a non-npm installer", ["pnpm", "install"]],
   ["npm install", ["npm", "install"]],
   ["scripts explicitly enabled", ["npm", "ci", "--ignore-scripts=false"]],
+  ["scripts enabled with split arguments", ["npm", "ci", "--ignore-scripts", "false"]],
+  ["scripts enabled with the negative flag", ["npm", "ci", "--no-ignore-scripts"]],
+  ["scripts enabled through config", ["npm", "ci", "--config.ignore-scripts=false"]],
+  ["an option terminator that bypasses enforced options", ["npm", "ci", "--"]],
 ])("refuses %s before starting an installation container", async (_name, installCommand) => {
   const calls: string[][] = [];
   const runtime = createNode24DockerRuntime({
@@ -319,4 +362,41 @@ it.each([
   });
   expect(result.outcome).toBe("failed");
   expect(calls.some(([verb]) => verb === "run")).toBe(false);
+});
+
+it("rejects a compressed archive whose expanded form exceeds the workspace limit", async () => {
+  const temporaryRoot = await mkdtemp(join(tmpdir(), "agentci-compressed-archive-test-"));
+  let dockerInvoked = false;
+  try {
+    const runtime = createNode24DockerRuntime({
+      runtimeImages: { "node-24": `node@sha256:${"a".repeat(64)}` },
+      archiveProvider: {
+        async fetchExactRevisionArchive() {
+          return gzipSync(Buffer.alloc(50 * 1024 * 1024 + 1));
+        },
+      },
+      docker: {
+        async run(_command, arguments_) {
+          if (arguments_[0] === "run") dockerInvoked = true;
+          return { exitCode: 0, stdout: "", stderr: "" };
+        },
+      },
+      temporaryRoot,
+    });
+
+    const result = await runtime.validate({
+      repository: "owner/repo",
+      revision: "1".repeat(40),
+      runtimeAlias: "node-24",
+      installCommand: ["npm", "ci"],
+      validationCommand: ["npm", "test"],
+      proposal: { summary: "repair", changes: [{ path: "a.txt", content: "after" }] },
+    });
+
+    expect(result.outcome).toBe("failed");
+    expect(dockerInvoked).toBe(false);
+    expect(await readdir(temporaryRoot)).toEqual([]);
+  } finally {
+    await rm(temporaryRoot, { recursive: true, force: true });
+  }
 });

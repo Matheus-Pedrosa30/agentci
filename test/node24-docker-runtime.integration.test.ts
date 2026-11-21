@@ -45,8 +45,11 @@ it.skipIf(!dockerAvailable)(
       assert.equal(fs.existsSync("install-script-ran"), false);
       assert.equal(fs.existsSync("node_modules/.package-lock.json"), true);
       assert.equal(fs.existsSync(".git"), false);
-      assert.equal(process.env.GITHUB_TOKEN, undefined);
-      assert.equal(process.env.OPENAI_API_KEY, undefined);
+      assert.equal(fs.existsSync("/var/run/docker.sock"), false);
+      assert.deepEqual(
+        Object.keys(process.env).filter((name) => /GITHUB|OPENAI|ANTHROPIC|TOKEN|SECRET|API_KEY/.test(name)),
+        [],
+      );
       const status = fs.readFileSync("/proc/self/status", "utf8");
       assert.match(status, /^CapEff:\s+0+$/m);
       assert.match(status, /^NoNewPrivs:\s+1$/m);
