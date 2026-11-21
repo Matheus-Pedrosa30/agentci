@@ -56,6 +56,26 @@ export function createGitHubAppIntakeApi(options: GitHubAppApiOptions): GitHubIn
   }
 
   return {
+    async getRepositoryPermission(input) {
+      const response = await fetchGitHub(
+        `${repositoryUrl(input.owner, input.repository)}/collaborators/${encodeURIComponent(input.username)}/permission`,
+        { headers: await installationHeaders(input.installationId) },
+      );
+      if (response.status === 404) return "none";
+      if (!response.ok) throw new Error("GitHub repository permission retrieval failed.");
+      const value = (await response.json()) as { permission?: unknown };
+      if (
+        value.permission !== "admin" &&
+        value.permission !== "maintain" &&
+        value.permission !== "write" &&
+        value.permission !== "triage" &&
+        value.permission !== "read" &&
+        value.permission !== "none"
+      ) {
+        throw new Error("GitHub returned an invalid repository permission.");
+      }
+      return value.permission;
+    },
     async getRepositoryContract(input) {
       const response = await fetchGitHub(
         `${repositoryUrl(input.owner, input.repository)}/contents/.agentci.json?ref=${encodeURIComponent(input.revision)}`,

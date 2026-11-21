@@ -318,7 +318,11 @@ export function createNode24DockerRuntime(options: Node24DockerRuntimeOptions): 
         });
         if (controller.signal.aborted) throw new Error("Sandbox validation timed out.");
         await extractArchive(archive, workspace);
-        const changedFiles = await applyProposal(workspace, input.proposal);
+        const baselineChangedFiles = input.baselineProposal
+          ? await applyProposal(workspace, input.baselineProposal)
+          : [];
+        const proposalChangedFiles = await applyProposal(workspace, input.proposal);
+        const changedFiles = [...new Set([...baselineChangedFiles, ...proposalChangedFiles])];
         const install = await docker.run(
           "docker",
           containerArguments({

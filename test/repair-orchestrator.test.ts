@@ -11,6 +11,79 @@ async function publishCurrent<T>(
   return { outcome: "published" as const, value: await publish() };
 }
 
+it("exposes a single-use Retry action for an Unresolved Repair", async () => {
+  const checks: unknown[] = [];
+  const orchestrator = createRepairOrchestrator({
+    github: {
+      async readTrackedTextFiles() {
+        throw new Error("not expected");
+      },
+      async ensureValidatedRepair() {
+        throw new Error("not expected");
+      },
+      async completeCheck(input) {
+        checks.push(input);
+      },
+    },
+    provider: {
+      alias: "repair",
+      provider: "fake-provider",
+      model: "fake-model",
+      async analyzeFailure() {
+        return { actionable: false, summary: "provider could not repair", requestedFiles: [] };
+      },
+      async proposeRepair() {
+        throw new Error("not expected");
+      },
+    },
+    sandbox: {
+      async validate() {
+        throw new Error("not expected");
+      },
+    },
+    persistence: {
+      async transition() {},
+      publishIfCurrent: publishCurrent,
+      async offerRetry() {
+        return "retry:attempt-retry:single-use";
+      },
+    },
+    clock: { now: () => new Date("2026-11-20T12:00:00.000Z") },
+  });
+
+  await orchestrator.advance({
+    attemptId: "attempt-retry",
+    runId: "9000",
+    repository: "owner/repository",
+    revision: "abc123",
+    defaultBranch: "main",
+    modelAlias: "repair",
+    runtimeAlias: "node-24",
+    allowedPaths: ["src/**"],
+    installCommand: ["npm", "ci"],
+    validationCommand: ["npm", "test"],
+    primaryFailure: {
+      jobId: "17",
+      jobName: "test",
+      stepNumber: 2,
+      stepName: "Unit tests",
+      log: "assertion failed",
+    },
+  });
+
+  expect(checks).toMatchObject([
+    {
+      actions: [
+        {
+          label: "Retry repair",
+          description: "Restart from the original failure.",
+          identifier: "retry:attempt-retry:single-use",
+        },
+      ],
+    },
+  ]);
+});
+
 it("publishes one validated Repair Proposal as a Draft Repair PR through fake boundaries", async () => {
   const calls: { kind: string; value: unknown }[] = [];
   const transitions: unknown[] = [];
@@ -710,12 +783,21 @@ it("tries at most three proposals for the same Primary Failure and reports bound
 it("stops after one proposal when validation reveals a different Primary Failure", async () => {
   let proposals = 0;
   let validations = 0;
+  const checks: unknown[] = [];
+  const continuations: unknown[] = [];
+  const revealedFailure = {
+    jobId: "17",
+    jobName: "test",
+    stepNumber: 5,
+    stepName: "Integration tests",
+    log: "a later step failed",
+  };
   const different = primaryFailureIdentity({
     revision: "chain123",
     workflow: "",
-    jobId: "17",
-    stepNumber: 5,
-    evidence: "a later step failed",
+    jobId: revealedFailure.jobId,
+    stepNumber: revealedFailure.stepNumber,
+    evidence: revealedFailure.log,
   });
   const orchestrator = createRepairOrchestrator({
     github: {
@@ -725,7 +807,9 @@ it("stops after one proposal when validation reveals a different Primary Failure
       async ensureValidatedRepair() {
         throw new Error("must not publish");
       },
-      async completeCheck() {},
+      async completeCheck(input) {
+        checks.push(input);
+      },
     },
     provider: {
       alias: "repair",
@@ -748,11 +832,19 @@ it("stops after one proposal when validation reveals a different Primary Failure
         return {
           outcome: "failed",
           observedFailureIdentity: different,
+          revealedFailure,
           summary: "a later step failed",
         } as const;
       },
     },
-    persistence: { async transition() {}, publishIfCurrent: publishCurrent },
+    persistence: {
+      async transition() {},
+      publishIfCurrent: publishCurrent,
+      async offerContinuation(input) {
+        continuations.push(input);
+        return "continue:attempt-chain:single-use";
+      },
+    },
     clock: { now: () => new Date("2026-11-20T12:00:00.000Z") },
   });
 
@@ -777,6 +869,138 @@ it("stops after one proposal when validation reveals a different Primary Failure
   });
 
   expect({ proposals, validations }).toEqual({ proposals: 1, validations: 1 });
+  expect(continuations).toMatchObject([
+    {
+      attemptId: "attempt-chain",
+      revealedFailure,
+      cumulativeChangedFiles: ["src/math.ts"],
+      cumulativeChangedLines: 2,
+    },
+  ]);
+  expect(checks).toMatchObject([
+    {
+      body: expect.stringContaining("Cumulative change: 1 file; 2 lines"),
+      actions: [
+        {
+          label: "Continue repair",
+          description: "Accept proposal and investigate next.",
+          identifier: "continue:attempt-chain:single-use",
+        },
+      ],
+    },
+  ]);
+});
+
+it("a Continuation uses its accepted baseline and stops at the next failure for another action", async () => {
+  const events: string[] = [];
+  const actions: unknown[] = [];
+  const secondFailure = {
+    jobId: "17",
+    jobName: "test",
+    stepNumber: 5,
+    stepName: "Integration tests",
+    log: "integration assertion failed",
+  };
+  const thirdFailure = {
+    jobId: "17",
+    jobName: "test",
+    stepNumber: 7,
+    stepName: "Package tests",
+    log: "package assertion failed",
+  };
+  const baselineProposal = {
+    summary: "repair unit tests",
+    changes: [{ path: "src/math.ts", content: "export const value = 2;\n" }],
+  };
+  const thirdIdentity = primaryFailureIdentity({
+    revision: "chain123",
+    workflow: "",
+    jobId: thirdFailure.jobId,
+    stepNumber: thirdFailure.stepNumber,
+    evidence: thirdFailure.log,
+  });
+  const orchestrator = createRepairOrchestrator({
+    github: {
+      async readTrackedTextFiles() {
+        return { "src/math.ts": "export const value = 1;\n" };
+      },
+      async ensureValidatedRepair() {
+        throw new Error("must not publish");
+      },
+      async completeCheck() {
+        events.push("check");
+      },
+    },
+    provider: {
+      alias: "repair",
+      provider: "fake-provider",
+      model: "fake-model",
+      async analyzeFailure() {
+        return { actionable: true, summary: "next failure", requestedFiles: ["src/math.ts"] };
+      },
+      async proposeRepair(input) {
+        events.push(`propose:${input.files["src/math.ts"]}`);
+        return {
+          summary: "repair integration tests",
+          changes: [{ path: "src/math.ts", content: "export const value = 3;\n" }],
+        };
+      },
+    },
+    sandbox: {
+      async validate(input) {
+        events.push(`validate:${input.baselineProposal?.summary ?? "no-baseline"}`);
+        return {
+          outcome: "failed",
+          observedFailureIdentity: thirdIdentity,
+          revealedFailure: thirdFailure,
+          summary: thirdFailure.log,
+        } as const;
+      },
+    },
+    persistence: {
+      async transition() {},
+      publishIfCurrent: publishCurrent,
+      async offerContinuation(input) {
+        actions.push(input);
+        return "continue:second:single-use";
+      },
+    },
+    clock: { now: () => new Date("2026-11-20T12:00:00.000Z") },
+  });
+
+  await expect(
+    orchestrator.advance({
+      attemptId: "attempt-continuation",
+      runId: "9011",
+      repository: "owner/repository",
+      revision: "chain123",
+      defaultBranch: "main",
+      modelAlias: "repair",
+      runtimeAlias: "node-24",
+      allowedPaths: ["src/**"],
+      installCommand: ["npm", "ci"],
+      validationCommand: ["npm", "test"],
+      primaryFailure: secondFailure,
+      baseline: {
+        proposal: baselineProposal,
+        cumulativeChangedFiles: ["src/math.ts"],
+        cumulativeChangedLines: 2,
+      },
+    }),
+  ).resolves.toEqual({ outcome: "unresolved" });
+
+  expect(events).toEqual([
+    "propose:export const value = 2;\n",
+    "validate:repair unit tests",
+    "check",
+  ]);
+  expect(actions).toMatchObject([
+    {
+      revealedFailure: thirdFailure,
+      cumulativeChangedFiles: ["src/math.ts"],
+      cumulativeChangedLines: 4,
+    },
+  ]);
 });
 
 it("cleans up bounded retries and cannot publish after the attempt becomes stale", async () => {
