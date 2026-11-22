@@ -5,7 +5,10 @@
 AI-powered CI/CD repair agent that analyzes failed pipelines, proposes patches, and validates them in isolated environments.
 
 > [!NOTE]
-> AgentCI is at an early stage. The first milestone is a deliberately small proof of concept for Node.js repositories.
+> AgentCI is at an early stage. Its repair core is language-agnostic, but the only validated Runtime Profile is `node-24`.
+
+See [secure local operation](docs/operator-guide.md) for GitHub App setup, trusted configuration,
+privacy and sandbox boundaries, repair lifecycle, and troubleshooting.
 
 ## Development
 
