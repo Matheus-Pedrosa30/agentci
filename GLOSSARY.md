@@ -40,10 +40,10 @@ _Avoid_: Cancelled repair, outdated fix
 Repository-provided instructions and constraints that define how AgentCI may install dependencies and validate a Repair Proposal.
 _Avoid_: Agent configuration, guessed commands
 
-**Sandbox Runtime**:
+**Runtime Profile**:
 An operator-approved, immutable container environment in which AgentCI prepares and validates Repair Proposals.
 _Avoid_: Repository image, arbitrary container
 
-**Repair PR**:
+**Draft Repair PR**:
 A draft pull request containing a Validated Repair for a human to review and decide whether to merge.
 _Avoid_: Automatic PR, bot fix

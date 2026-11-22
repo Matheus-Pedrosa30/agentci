@@ -5,7 +5,10 @@
 AI-powered CI/CD repair agent that analyzes failed pipelines, proposes patches, and validates them in isolated environments.
 
 > [!NOTE]
-> AgentCI is at an early stage. The first milestone is a deliberately small proof of concept for Node.js repositories.
+> AgentCI is at an early stage. Its repair core is language-agnostic, but the only validated Runtime Profile is `node-24`.
+
+See [secure local operation](docs/operator-guide.md) for GitHub App setup, trusted configuration,
+privacy and sandbox boundaries, repair lifecycle, and troubleshooting.
 
 ## Development
 
@@ -50,14 +53,14 @@ Build and validate the environment without starting a Repair Attempt:
 
 ```bash
 npm run build
-agentci doctor
+node dist/cli.js doctor
 ```
 
-Use `agentci doctor --config /trusted/path/agentci.config.ts` to select another trusted config file. The command checks Docker, the SQLite location, GitHub App credential variables, provider and model aliases, and Runtime Profile image pins. It reports all detected problems together and exits nonzero unless the environment is ready.
+Use `node dist/cli.js doctor --config /trusted/path/agentci.config.ts` to select another trusted config file. If you register the package's `agentci` bin on `PATH`, `agentci doctor` is the equivalent command. The command checks Docker, the SQLite location, GitHub App credential variables, provider and model aliases, and Runtime Profile image pins. It reports all detected problems together and exits nonzero unless the environment is ready.
 
 ## Webhook intake
 
-After `agentci doctor` succeeds, start the local service with `agentci start` (or pass the same `--config` option used for `doctor`). The service exposes `GET /health` and accepts GitHub App `workflow_run` deliveries at `POST /github/webhook`. Configure the GitHub App with the same webhook secret named by the trusted configuration.
+After `doctor` succeeds, start the local service with `node dist/cli.js start` (or pass the same `--config` option used for `doctor`). The service exposes `GET /health` and accepts GitHub App `workflow_run` deliveries at `POST /github/webhook`. Configure the GitHub App with the same webhook secret named by the trusted configuration.
 
 Eligible repositories opt in with `.agentci.json` at the failed workflow revision:
 
