@@ -68,6 +68,8 @@ export interface GitHubIntakeApi {
 
 export interface RepairAttemptMetadata {
   id: number;
+  /** Stable AgentCI identifier; distinct from the originating GitHub workflow run ID. */
+  attemptKey: string;
   workflowRunId: string;
   status:
     | "queued"
@@ -92,7 +94,7 @@ export interface RepairAttemptMetadata {
   rootAttemptId?: number;
   action?: "initial" | "retry" | "continuation";
   primaryFailure?: Omit<PrimaryFailure, "log">;
-  cumulativeChangedFiles?: readonly string[];
+  cumulativeChangedFileCount?: number;
   cumulativeChangedLines?: number;
 }
 
@@ -182,6 +184,40 @@ interface AttemptRow {
   primary_step_number: number | null;
   primary_step_name: string | null;
   root_attempt_id: number | null;
+}
+
+interface OfferedRepairAction {
+  attemptId: number;
+  kind: "retry" | "continuation";
+  expiresAt: string;
+  consumedAt: string | null;
+  repository: string;
+  revision: string;
+  installationId: number;
+}
+
+interface ContinuationLineage {
+  revealedFailure: Omit<PrimaryFailure, "log">;
+  cumulativeChangedFileCount: number;
+  cumulativeChangedLines: number;
+}
+
+/** Persistence seam for the action invariant: consume once and create exactly one linked attempt. */
+interface AttemptRepository {
+  findOfferedAction(identifier: string): OfferedRepairAction | undefined;
+  consumeActionAndCreateLinkedAttempt(input: {
+    identifier: string;
+    at: string;
+    continuation?: ContinuationLineage;
+  }):
+    | { outcome: "ignored" }
+    | {
+        outcome: "queued";
+        attemptId: string;
+        sourceAttemptId: string;
+        kind: "retry" | "continuation";
+        expiresAt: string;
+      };
 }
 
 function validSignature(secret: string, body: Uint8Array, supplied: string | undefined): boolean {
@@ -311,7 +347,7 @@ export function createWebhookIntake(options: IntakeOptions): WebhookIntake {
       parent_attempt_id INTEGER,
       root_attempt_id INTEGER,
       action TEXT,
-      cumulative_changed_files TEXT,
+      cumulative_changed_file_count INTEGER,
       cumulative_changed_lines INTEGER,
       input_tokens INTEGER,
       output_tokens INTEGER,
@@ -355,8 +391,8 @@ export function createWebhookIntake(options: IntakeOptions): WebhookIntake {
     ["root_attempt_id", "ALTER TABLE repair_attempts ADD COLUMN root_attempt_id INTEGER"],
     ["action", "ALTER TABLE repair_attempts ADD COLUMN action TEXT"],
     [
-      "cumulative_changed_files",
-      "ALTER TABLE repair_attempts ADD COLUMN cumulative_changed_files TEXT",
+      "cumulative_changed_file_count",
+      "ALTER TABLE repair_attempts ADD COLUMN cumulative_changed_file_count INTEGER",
     ],
     [
       "cumulative_changed_lines",
@@ -380,6 +416,10 @@ export function createWebhookIntake(options: IntakeOptions): WebhookIntake {
   if (!attemptColumns.has("source_workflow_run_id")) {
     database.exec("UPDATE repair_attempts SET source_workflow_run_id = workflow_run_id");
   }
+  if (attemptColumns.has("cumulative_changed_files")) {
+    database.exec("PRAGMA secure_delete = ON");
+    database.exec("UPDATE repair_attempts SET cumulative_changed_files = NULL");
+  }
   database
     .prepare(
       `UPDATE repair_attempts
@@ -400,6 +440,20 @@ export function createWebhookIntake(options: IntakeOptions): WebhookIntake {
        WHERE status IN ('proposing', 'validating', 'publishing')`,
     )
     .run();
+  database
+    .prepare(
+      `UPDATE repair_attempts
+       SET status = 'unresolved',
+           summary = 'Unresolved Repair: Continuation baseline expired during interruption.',
+           worker_state = 'effect_pending', claim_token = NULL, check_status = 'pending',
+           updated_at = CURRENT_TIMESTAMP
+       WHERE action = 'continuation' AND status = 'primary_failure'
+         AND worker_state IN ('available', 'effect_pending')`,
+    )
+    .run();
+  database
+    .prepare("DELETE FROM repair_actions WHERE kind = 'continuation' AND consumed_at IS NULL")
+    .run();
 
   let exclusiveTail = Promise.resolve();
   const offeredContinuations = new Map<
@@ -409,12 +463,138 @@ export function createWebhookIntake(options: IntakeOptions): WebhookIntake {
       revealedFailure: PrimaryFailure;
       cumulativeChangedFiles: readonly string[];
       cumulativeChangedLines: number;
+      cleanupTimer: NodeJS.Timeout;
     }
   >();
   const queuedContinuationContexts = new Map<
     string,
-    { proposal: PolicyProposal; revealedFailure: PrimaryFailure }
+    {
+      proposal: PolicyProposal;
+      revealedFailure: PrimaryFailure;
+      cleanupTimer: NodeJS.Timeout;
+    }
   >();
+  function cleanupOfferedContinuation(identifier: string): void {
+    const context = offeredContinuations.get(identifier);
+    if (context) clearTimeout(context.cleanupTimer);
+    offeredContinuations.delete(identifier);
+  }
+  function cleanupQueuedContinuation(attemptId: string): void {
+    const context = queuedContinuationContexts.get(attemptId);
+    if (context) clearTimeout(context.cleanupTimer);
+    queuedContinuationContexts.delete(attemptId);
+  }
+  function cleanupDelay(at: string, expiresAt: string): number {
+    return Math.max(1, Date.parse(expiresAt) - Date.parse(at));
+  }
+  const attemptRepository: AttemptRepository = {
+    findOfferedAction(identifier) {
+      return database
+        .prepare(
+          `SELECT actions.attempt_id AS attemptId, actions.kind, actions.expires_at AS expiresAt,
+                  actions.consumed_at AS consumedAt, attempts.repository, attempts.revision,
+                  attempts.installation_id AS installationId
+           FROM repair_actions AS actions
+           JOIN repair_attempts AS attempts ON attempts.id = actions.attempt_id
+           WHERE actions.identifier = ?`,
+        )
+        .get(identifier) as OfferedRepairAction | undefined;
+    },
+    consumeActionAndCreateLinkedAttempt(input) {
+      database.exec("BEGIN IMMEDIATE");
+      try {
+        const action = this.findOfferedAction(input.identifier);
+        if (
+          !action ||
+          action.consumedAt ||
+          Date.parse(action.expiresAt) <= Date.parse(input.at) ||
+          (action.kind === "continuation" && !input.continuation)
+        ) {
+          database.exec("COMMIT");
+          return { outcome: "ignored" };
+        }
+        const source = database
+          .prepare("SELECT * FROM repair_attempts WHERE id = ? AND status = 'unresolved'")
+          .get(action.attemptId) as AttemptRow | undefined;
+        if (!source) {
+          database.exec("COMMIT");
+          return { outcome: "ignored" };
+        }
+        const rootAttemptId = Number(source.root_attempt_id ?? action.attemptId);
+        const root = database
+          .prepare("SELECT * FROM repair_attempts WHERE id = ?")
+          .get(rootAttemptId) as AttemptRow | undefined;
+        if (!root) throw new Error("Repair Attempt root is unavailable.");
+
+        const consumed = database
+          .prepare(
+            `UPDATE repair_actions SET consumed_at = ?
+             WHERE identifier = ? AND consumed_at IS NULL AND expires_at > ?`,
+          )
+          .run(input.at, input.identifier, input.at);
+        if (consumed.changes === 0) {
+          database.exec("COMMIT");
+          return { outcome: "ignored" };
+        }
+
+        // The legacy column stores AgentCI's attempt key. source_workflow_run_id is the
+        // actual GitHub workflow-run identifier shared by every attempt in the lineage.
+        const workflowRunId = String(root.source_workflow_run_id ?? root.workflow_run_id);
+        const attemptKey = `${workflowRunId}:${action.kind}:${input.identifier}`;
+        const selectedFailure = input.continuation?.revealedFailure;
+        const inserted = database
+          .prepare(
+            `INSERT INTO repair_attempts
+             (workflow_run_id, source_workflow_run_id, status, repository, branch, revision,
+              workflow, job, model_alias, runtime_alias, summary, installation_id,
+              primary_job_id, primary_job_name, primary_step_number, primary_step_name,
+              parent_attempt_id, root_attempt_id, action,
+              cumulative_changed_file_count, cumulative_changed_lines)
+             VALUES (?, ?, 'primary_failure', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            attemptKey,
+            workflowRunId,
+            root.repository,
+            root.branch,
+            root.revision,
+            root.workflow,
+            root.job,
+            root.model_alias,
+            root.runtime_alias,
+            action.kind === "retry"
+              ? "Retry queued from the original revision and Primary Failure."
+              : "Continuation queued with the accepted proposal as its baseline.",
+            root.installation_id,
+            selectedFailure?.jobId ?? root.primary_job_id,
+            selectedFailure?.jobName ?? root.primary_job_name ?? root.job,
+            selectedFailure?.stepNumber ?? root.primary_step_number,
+            selectedFailure?.stepName ?? root.primary_step_name,
+            action.attemptId,
+            rootAttemptId,
+            action.kind,
+            action.kind === "continuation"
+              ? (input.continuation?.cumulativeChangedFileCount ?? null)
+              : null,
+            action.kind === "continuation"
+              ? (input.continuation?.cumulativeChangedLines ?? null)
+              : null,
+          );
+        if (inserted.changes !== 1) throw new Error("Repair Attempt could not be queued.");
+        database.exec("COMMIT");
+        return {
+          outcome: "queued",
+          attemptId: String(inserted.lastInsertRowid),
+          sourceAttemptId: String(action.attemptId),
+          kind: action.kind,
+          expiresAt: action.expiresAt,
+        };
+      } catch (error) {
+        if (database.isTransaction) database.exec("ROLLBACK");
+        throw error;
+      }
+    },
+  };
   async function exclusively<T>(operation: () => T | Promise<T>): Promise<T> {
     let release!: () => void;
     const predecessor = exclusiveTail;
@@ -439,33 +619,14 @@ export function createWebhookIntake(options: IntakeOptions): WebhookIntake {
         if (!payload || !delivery.deliveryId) return { status: 422, outcome: "rejected" };
         const [owner, repository, extra] = payload.repository.full_name.split("/");
         if (!owner || !repository || extra) return { status: 422, outcome: "rejected" };
-        const action = database
-          .prepare(
-            `SELECT actions.attempt_id AS attemptId, actions.kind, actions.expires_at AS expiresAt,
-                    actions.consumed_at AS consumedAt, attempts.repository, attempts.revision,
-                    attempts.installation_id AS installationId
-             FROM repair_actions AS actions
-             JOIN repair_attempts AS attempts ON attempts.id = actions.attempt_id
-             WHERE actions.identifier = ?`,
-          )
-          .get(payload.requested_action.identifier) as
-          | {
-              attemptId: number;
-              kind: "retry" | "continuation";
-              expiresAt: string;
-              consumedAt: string | null;
-              repository: string;
-              revision: string;
-              installationId: number;
-            }
-          | undefined;
+        const action = attemptRepository.findOfferedAction(payload.requested_action.identifier);
         if (!action || action.consumedAt) return { status: 202, outcome: "ignored" };
         const continuation = offeredContinuations.get(payload.requested_action.identifier);
         if (action.kind === "continuation" && !continuation) {
           return { status: 202, outcome: "ignored" };
         }
         if (Date.parse(action.expiresAt) <= (options.now?.() ?? new Date()).getTime()) {
-          offeredContinuations.delete(payload.requested_action.identifier);
+          cleanupOfferedContinuation(payload.requested_action.identifier);
           return { status: 202, outcome: "ignored" };
         }
         if (
@@ -486,90 +647,56 @@ export function createWebhookIntake(options: IntakeOptions): WebhookIntake {
           return { status: 202, outcome: "ignored" };
         }
         return exclusively(() => {
-          database.exec("BEGIN IMMEDIATE");
-          try {
-            const consumed = database
-              .prepare(
-                `UPDATE repair_actions SET consumed_at = ?
-                 WHERE identifier = ? AND consumed_at IS NULL AND expires_at > ?`,
-              )
-              .run(
-                (options.now?.() ?? new Date()).toISOString(),
-                payload.requested_action.identifier,
-                (options.now?.() ?? new Date()).toISOString(),
-              );
-            if (consumed.changes === 0) {
-              database.exec("COMMIT");
-              return { status: 202 as const, outcome: "ignored" as const };
-            }
-            const source = database
-              .prepare("SELECT * FROM repair_attempts WHERE id = ? AND status = 'unresolved'")
-              .get(action.attemptId) as AttemptRow | undefined;
-            if (!source) {
-              database.exec("ROLLBACK");
-              return { status: 202 as const, outcome: "ignored" as const };
-            }
-            const rootAttemptId = Number(source.root_attempt_id ?? action.attemptId);
-            const root = database
-              .prepare("SELECT * FROM repair_attempts WHERE id = ?")
-              .get(rootAttemptId) as unknown as AttemptRow;
-            const attemptKey = `${String(root.source_workflow_run_id ?? root.workflow_run_id)}:${action.kind}:${payload.requested_action.identifier}`;
-            const selectedFailure = continuation?.revealedFailure;
-            const inserted = database
-              .prepare(
-                `INSERT INTO repair_attempts
-                 (workflow_run_id, source_workflow_run_id, status, repository, branch, revision,
-                  workflow, job, model_alias, runtime_alias, summary, installation_id,
-                  primary_job_id, primary_job_name, primary_step_number, primary_step_name,
-                  parent_attempt_id, root_attempt_id, action,
-                  cumulative_changed_files, cumulative_changed_lines)
-                 VALUES (?, ?, 'primary_failure', ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-              )
-              .run(
-                attemptKey,
-                root.source_workflow_run_id ?? root.workflow_run_id,
-                root.repository,
-                root.branch,
-                root.revision,
-                root.workflow,
-                root.job,
-                root.model_alias,
-                root.runtime_alias,
-                action.kind === "retry"
-                  ? "Retry queued from the original revision and Primary Failure."
-                  : "Continuation queued with the accepted proposal as its baseline.",
-                root.installation_id,
-                selectedFailure?.jobId ?? root.primary_job_id,
-                selectedFailure?.jobName ?? root.primary_job_name ?? root.job,
-                selectedFailure?.stepNumber ?? root.primary_step_number,
-                selectedFailure?.stepName ?? root.primary_step_name,
-                action.attemptId,
-                rootAttemptId,
-                action.kind,
-                action.kind === "continuation"
-                  ? JSON.stringify(continuation?.cumulativeChangedFiles ?? [])
-                  : null,
-                action.kind === "continuation"
-                  ? (continuation?.cumulativeChangedLines ?? null)
-                  : null,
-              );
-            if (inserted.changes !== 1) throw new Error("Repair Attempt could not be queued.");
-            database.exec("COMMIT");
-            if (action.kind === "continuation" && continuation) {
-              queuedContinuationContexts.set(String(inserted.lastInsertRowid), {
-                proposal: continuation.proposal,
-                revealedFailure: continuation.revealedFailure,
-              });
-              offeredContinuations.delete(payload.requested_action.identifier);
-            }
-            if (action.kind === "retry") {
-              queuedContinuationContexts.delete(String(action.attemptId));
-            }
-            return { status: 202 as const, outcome: "queued" as const };
-          } catch (error) {
-            if (database.isTransaction) database.exec("ROLLBACK");
-            throw error;
+          const now = (options.now?.() ?? new Date()).toISOString();
+          const result = attemptRepository.consumeActionAndCreateLinkedAttempt({
+            identifier: payload.requested_action.identifier,
+            at: now,
+            ...(continuation
+              ? {
+                  continuation: {
+                    revealedFailure: {
+                      jobId: continuation.revealedFailure.jobId,
+                      jobName: continuation.revealedFailure.jobName,
+                      stepNumber: continuation.revealedFailure.stepNumber,
+                      stepName: continuation.revealedFailure.stepName,
+                    },
+                    cumulativeChangedFileCount: new Set(continuation.cumulativeChangedFiles).size,
+                    cumulativeChangedLines: continuation.cumulativeChangedLines,
+                  },
+                }
+              : {}),
+          });
+          if (result.outcome === "ignored") {
+            return { status: 202 as const, outcome: "ignored" as const };
           }
+          if (result.kind === "continuation" && continuation) {
+            const linkedAttemptId = result.attemptId;
+            cleanupOfferedContinuation(payload.requested_action.identifier);
+            const cleanupTimer = setTimeout(
+              () => {
+                queuedContinuationContexts.delete(linkedAttemptId);
+                database
+                  .prepare(
+                    `UPDATE repair_attempts
+                     SET status = 'unresolved',
+                         summary = 'Unresolved Repair: Continuation baseline expired before processing.',
+                         updated_at = CURRENT_TIMESTAMP
+                     WHERE id = ? AND action = 'continuation' AND status = 'primary_failure'
+                       AND worker_state = 'available'`,
+                  )
+                  .run(linkedAttemptId);
+              },
+              cleanupDelay(now, result.expiresAt),
+            );
+            cleanupTimer.unref();
+            queuedContinuationContexts.set(linkedAttemptId, {
+              proposal: continuation.proposal,
+              revealedFailure: continuation.revealedFailure,
+              cleanupTimer,
+            });
+          }
+          if (result.kind === "retry") cleanupQueuedContinuation(result.sourceAttemptId);
+          return { status: 202 as const, outcome: "queued" as const };
         });
       }
       if (delivery.event !== "workflow_run") {
@@ -680,14 +807,15 @@ export function createWebhookIntake(options: IntakeOptions): WebhookIntake {
     listAttempts() {
       return database
         .prepare(
-          `SELECT id, COALESCE(source_workflow_run_id, workflow_run_id) AS workflowRunId,
+          `SELECT id, workflow_run_id AS attemptKey,
+                  COALESCE(source_workflow_run_id, workflow_run_id) AS workflowRunId,
                   status, repository, branch, revision,
                   workflow, job, model_alias AS modelAlias, runtime_alias AS runtimeAlias, summary,
                   input_tokens AS inputTokens, output_tokens AS outputTokens,
                   parent_attempt_id AS parentAttemptId, root_attempt_id AS rootAttemptId, action,
                   primary_job_id AS primaryJobId, primary_job_name AS primaryJobName,
                   primary_step_number AS primaryStepNumber, primary_step_name AS primaryStepName,
-                  cumulative_changed_files AS cumulativeChangedFiles,
+                  cumulative_changed_file_count AS cumulativeChangedFileCount,
                   cumulative_changed_lines AS cumulativeChangedLines
            FROM repair_attempts ORDER BY id`,
         )
@@ -703,7 +831,7 @@ export function createWebhookIntake(options: IntakeOptions): WebhookIntake {
             primaryJobName,
             primaryStepNumber,
             primaryStepName,
-            cumulativeChangedFiles,
+            cumulativeChangedFileCount,
             cumulativeChangedLines,
             ...attempt
           } = row as unknown as Omit<RepairAttemptMetadata, "inputTokens" | "outputTokens"> & {
@@ -716,7 +844,7 @@ export function createWebhookIntake(options: IntakeOptions): WebhookIntake {
             primaryJobName: string | null;
             primaryStepNumber: number | null;
             primaryStepName: string | null;
-            cumulativeChangedFiles: string | null;
+            cumulativeChangedFileCount: number | null;
             cumulativeChangedLines: number | null;
           };
           return {
@@ -739,9 +867,7 @@ export function createWebhookIntake(options: IntakeOptions): WebhookIntake {
                     stepName: primaryStepName,
                   },
                 }),
-            ...(cumulativeChangedFiles === null
-              ? {}
-              : { cumulativeChangedFiles: JSON.parse(cumulativeChangedFiles) as string[] }),
+            ...(cumulativeChangedFileCount === null ? {} : { cumulativeChangedFileCount }),
             ...(cumulativeChangedLines === null ? {} : { cumulativeChangedLines }),
           };
         });
@@ -1068,15 +1194,26 @@ export function createWebhookIntake(options: IntakeOptions): WebhookIntake {
         revealedFailure: input.revealedFailure,
         cumulativeChangedFiles: [...input.cumulativeChangedFiles],
         cumulativeChangedLines: input.cumulativeChangedLines,
+        cleanupTimer: (() => {
+          const timer = setTimeout(
+            () => offeredContinuations.delete(identifier),
+            cleanupDelay(input.at, input.expiresAt),
+          );
+          timer.unref();
+          return timer;
+        })(),
       });
       return identifier;
     },
     takeContinuationContext(attemptId) {
       const context = queuedContinuationContexts.get(attemptId);
-      if (context) queuedContinuationContexts.delete(attemptId);
-      return context;
+      if (!context) return undefined;
+      cleanupQueuedContinuation(attemptId);
+      return { proposal: context.proposal, revealedFailure: context.revealedFailure };
     },
     close() {
+      for (const context of offeredContinuations.values()) clearTimeout(context.cleanupTimer);
+      for (const context of queuedContinuationContexts.values()) clearTimeout(context.cleanupTimer);
       offeredContinuations.clear();
       queuedContinuationContexts.clear();
       database.close();

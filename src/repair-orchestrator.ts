@@ -149,6 +149,22 @@ function mergeProposals(
   return { summary: proposal.summary, changes: [...changes.values()] };
 }
 
+function cumulativeLineage(
+  baseline: RepairAttemptInput["baseline"],
+  proposal: RepairProposal,
+  changedLines: number,
+): { changedFiles: string[]; changedLines: number } {
+  return {
+    changedFiles: [
+      ...new Set([
+        ...(baseline?.cumulativeChangedFiles ?? []),
+        ...proposal.changes.map((change) => change.path),
+      ]),
+    ],
+    changedLines: (baseline?.cumulativeChangedLines ?? 0) + changedLines,
+  };
+}
+
 function validUsage(value: unknown): value is TokenUsage {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
   const usage = value as TokenUsage;
@@ -518,28 +534,17 @@ export function createRepairOrchestrator(dependencies: RepairOrchestratorDepende
             status: "unresolved",
             at: at(),
           });
+          const lineage = cumulativeLineage(attempt.baseline, proposal, evaluation.changedLines);
           const actionIdentifier = await dependencies.persistence.offerContinuation({
             attemptId: attempt.attemptId,
             at: at(),
             expiresAt: new Date(dependencies.clock.now().getTime() + 15 * 60_000).toISOString(),
             proposal: mergeProposals(attempt.baseline?.proposal, proposal),
             revealedFailure: validation.revealedFailure,
-            cumulativeChangedFiles: [
-              ...new Set([
-                ...(attempt.baseline?.cumulativeChangedFiles ?? []),
-                ...proposal.changes.map((change) => change.path),
-              ]),
-            ],
-            cumulativeChangedLines:
-              (attempt.baseline?.cumulativeChangedLines ?? 0) + evaluation.changedLines,
+            cumulativeChangedFiles: lineage.changedFiles,
+            cumulativeChangedLines: lineage.changedLines,
           });
-          const cumulativeChangedFiles = new Set([
-            ...(attempt.baseline?.cumulativeChangedFiles ?? []),
-            ...proposal.changes.map((change) => change.path),
-          ]);
-          const cumulativeChangedLines =
-            (attempt.baseline?.cumulativeChangedLines ?? 0) + evaluation.changedLines;
-          const fileCount = cumulativeChangedFiles.size;
+          const fileCount = lineage.changedFiles.length;
           await dependencies.github.completeCheck({
             repository: attempt.repository,
             revision: attempt.revision,
@@ -547,7 +552,7 @@ export function createRepairOrchestrator(dependencies: RepairOrchestratorDepende
             title: "AgentCI stopped at a newly revealed Primary Failure",
             body: [
               "Unresolved Repair: Validation revealed a different Primary Failure; Continuation requires developer authorization.",
-              `Cumulative change: ${fileCount} ${fileCount === 1 ? "file" : "files"}; ${cumulativeChangedLines} lines`,
+              `Cumulative change: ${fileCount} ${fileCount === 1 ? "file" : "files"}; ${lineage.changedLines} lines`,
               `Proposal count: ${proposalCount}`,
               `Rejected proposals: ${rejections.map((summary, index) => `${index + 1}. ${auditText(summary)}`).join("; ")}`,
               `Usage: Input tokens: ${inputTokens}; output tokens: ${outputTokens}`,
