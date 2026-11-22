@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
+import { runInNewContext } from "node:vm";
 import { expect, it } from "vitest";
 
 import { parseRepositoryContract } from "../src/repository-contract.js";
@@ -55,7 +56,29 @@ it("keeps the documented Repository Contract executable and schema-accurate", ()
 
 it("keeps the operator configuration example aligned with the CLI schema and credential-safe", () => {
   const guide = read("docs/operator-guide.md");
-  const config = fencedExample(guide, "operator-config");
+  const source = fencedExample(guide, "operator-config");
+  const expression = source.replace(/^export default\s+/u, "").replace(/;\s*$/u, "");
+  const config = runInNewContext(`(${expression})`) as unknown;
+  expect(config).toEqual({
+    database: { path: "/var/lib/agentci/agentci.sqlite" },
+    server: { host: "127.0.0.1", port: 3000 },
+    github: {
+      appIdEnv: "AGENTCI_GITHUB_APP_ID",
+      privateKeyEnv: "AGENTCI_GITHUB_PRIVATE_KEY",
+      webhookSecretEnv: "AGENTCI_GITHUB_WEBHOOK_SECRET",
+    },
+    providers: {
+      primary: { type: "openai", apiKeyEnv: "OPENAI_API_KEY" },
+    },
+    models: {
+      repair: { provider: "primary", model: "operator-selected-model" },
+    },
+    runtimes: {
+      "node-24": {
+        image: `node@sha256:${"a".repeat(64)}`,
+      },
+    },
+  });
   for (const field of [
     'database: { path: "/var/lib/agentci/agentci.sqlite" }',
     'appIdEnv: "AGENTCI_GITHUB_APP_ID"',
@@ -66,9 +89,9 @@ it("keeps the operator configuration example aligned with the CLI schema and cre
     '"node-24": {',
     'image: "node@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"',
   ]) {
-    expect(config).toContain(field);
+    expect(source).toContain(field);
   }
-  expect(config).not.toMatch(/BEGIN [^-]*PRIVATE KEY|github_pat_|ghp_|sk-[A-Za-z\d]/u);
+  expect(source).not.toMatch(/BEGIN [^-]*PRIVATE KEY|github_pat_|ghp_|sk-[A-Za-z\d]/u);
 });
 
 it("documents secure operation, lifecycle, and the validated runtime boundary", () => {
@@ -93,11 +116,27 @@ it("documents secure operation, lifecycle, and the validated runtime boundary", 
   expect(guide).toContain("Continuation");
 
   const troubleshooting = guide.slice(guide.indexOf("## Troubleshooting"));
-  expect(troubleshooting).toMatch(/1\. Run `agentci doctor/u);
+  expect(troubleshooting).toMatch(/1\. Run `node dist\/cli\.js doctor/u);
+  expect(guide).toContain('from "/opt/agentci/dist/index.js"');
+  expect(guide).not.toContain('from "agentci"');
+});
+
+it("uses commands that work from the documented source checkout", () => {
+  const guide = read("docs/operator-guide.md");
+  expect(guide).toContain("npm ci --ignore-scripts\nnpm run build");
+  expect(guide).toContain("node dist/cli.js doctor --config /trusted/path/agentci.config.ts");
+  expect(guide).toContain("node dist/cli.js start --config /trusted/path/agentci.config.ts");
 });
 
 it("keeps the README entry point synchronized with the operator guide", () => {
   const readme = read("README.md");
   expect(readme).toContain("[secure local operation](docs/operator-guide.md)");
   expect(readme).toContain("only validated Runtime Profile is `node-24`");
+  expect(readme).toContain("node dist/cli.js doctor");
+});
+
+it("keeps specification terminology synchronized with the domain glossary", () => {
+  const glossary = read("GLOSSARY.md");
+  expect(glossary).toContain("**Runtime Profile**:");
+  expect(glossary).toContain("**Draft Repair PR**:");
 });

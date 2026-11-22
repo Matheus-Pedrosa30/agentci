@@ -23,8 +23,18 @@ Profile is `node-24`.
 - A writable local directory for SQLite and a GitHub App installed on selected repositories.
 - Provider credentials in environment variables when using a model adapter.
 
-Build from a reviewed checkout with `npm ci --ignore-scripts && npm run build`. Run
-`agentci doctor --config /trusted/path/agentci.config.ts` before `agentci start`.
+Build from a reviewed checkout:
+
+```bash
+npm ci --ignore-scripts
+npm run build
+```
+
+The examples below invoke the built CLI directly because this package is currently private and is
+not installed globally. If you register its `agentci` bin on `PATH`, `agentci doctor` and
+`agentci start` are equivalent. Run
+`node dist/cli.js doctor --config /trusted/path/agentci.config.ts` before
+`node dist/cli.js start --config /trusted/path/agentci.config.ts`.
 
 ## Create the GitHub App manually
 
@@ -104,10 +114,10 @@ digest for the exact image you approved. The current CLI configuration schema ac
 key variable to be present; the private-key variable contains PEM text, not a path. Load real
 values from a secret manager or protected files into the service environment. Never commit them.
 
-Run `agentci doctor --config /trusted/path/agentci.config.ts`. It checks Docker, the SQLite path,
+Run `node dist/cli.js doctor --config /trusted/path/agentci.config.ts`. It checks Docker, the SQLite path,
 GitHub environment values, provider/model references, and SHA-256 image pins and reports all
 detected problems without printing secret values. Only then run the matching
-`agentci start --config /trusted/path/agentci.config.ts`. Check `GET /health` locally before
+`node dist/cli.js start --config /trusted/path/agentci.config.ts`. Check `GET /health` locally before
 enabling webhook deliveries.
 
 ## Repository Contract
@@ -147,7 +157,7 @@ The repair core consumes the AI SDK `LanguageModelV4` interface. The library inc
 can supply any operator-created `LanguageModelV4` through `createModelRegistry`:
 
 ```ts
-import { createModelRegistry } from "agentci";
+import { createModelRegistry } from "/opt/agentci/dist/index.js";
 import type { LanguageModelV4 } from "@ai-sdk/provider";
 
 declare const operatorModel: LanguageModelV4;
@@ -155,8 +165,12 @@ const registry = createModelRegistry({ repair: operatorModel });
 const provider = registry.createRepairProvider("repair");
 ```
 
-This registry is an embedding/library seam today; the trusted CLI config loader does not import
-custom providers and accepts only its current `openai` config shape. Built-in adapter factories
+The example assumes the reviewed checkout was built at `/opt/agentci`; use the actual absolute
+path to that checkout. `agentci` is not currently a published importable package. This registry is
+an embedding/library seam today; it is not loaded by `agentci start`.
+
+The trusted CLI config loader does not import custom providers and accepts only its current
+`openai` config shape. Built-in adapter factories
 read the named credential variable when instantiated. AgentCI sends bounded evidence and selected
 files to the one operator-selected endpoint. Providers receive no host tools or autonomous
 repository access, and there is no automatic provider/model fallback. Usage token counts are
@@ -244,7 +258,8 @@ are not validated milestone claims.
 
 ## Troubleshooting
 
-1. Run `agentci doctor --config /trusted/path/agentci.config.ts` first. Fix every diagnostic before
+1. Run `node dist/cli.js doctor --config /trusted/path/agentci.config.ts` first (the
+   source-checkout form of `agentci doctor`). Fix every diagnostic before
    restarting; the command aggregates failures and exits nonzero when the environment is not ready.
 2. If Docker is unavailable, run `docker info` as the same OS account. Confirm the daemon is
    running and the approved `node@sha256:...` digest is reachable.
