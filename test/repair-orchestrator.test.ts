@@ -1,5 +1,6 @@
 import { expect, it } from "vitest";
 
+import { RepairProviderError, type RepairProviderErrorKind } from "../src/model-provider.js";
 import { createRepairOrchestrator } from "../src/repair-orchestrator.js";
 import { primaryFailureIdentity } from "../src/proposal-policy.js";
 
@@ -876,4 +877,140 @@ it("cleans up bounded retries and cannot publish after the attempt becomes stale
     "guard:stale",
     "check:AgentCI stopped a Stale Repair",
   ]);
+});
+
+it.each([
+  ["provider_error", "The model provider request failed."],
+  ["quota_exceeded", "The model provider quota was exceeded."],
+  ["invalid_structured_output", "The model provider returned invalid structured output."],
+  ["missing_usage", "The model provider response omitted required usage data."],
+] as const)("terminates explicitly for %s without provider fallback", async (kind, reason) => {
+  const checks: Array<{ body: string }> = [];
+  let calls = 0;
+  const orchestrator = createRepairOrchestrator({
+    github: {
+      async readTrackedTextFiles() {
+        throw new Error("source files must not be read");
+      },
+      async ensureValidatedRepair() {
+        throw new Error("a Repair PR must not be published");
+      },
+      async completeCheck(input) {
+        checks.push(input);
+      },
+    },
+    models: {
+      createRepairProvider(alias) {
+        expect(alias).toBe("repair");
+        return {
+          alias,
+          provider: "mock-provider",
+          model: "mock-model",
+          async analyzeFailure() {
+            calls += 1;
+            throw new RepairProviderError(kind as RepairProviderErrorKind);
+          },
+          async proposeRepair() {
+            throw new Error("a Repair Proposal must not be requested");
+          },
+        };
+      },
+    },
+    sandbox: {
+      async validate() {
+        throw new Error("the sandbox must not run");
+      },
+    },
+    persistence: { async transition() {}, publishIfCurrent: publishCurrent },
+    clock: { now: () => new Date("2026-11-20T12:00:00.000Z") },
+  });
+
+  await expect(
+    orchestrator.advance({
+      attemptId: `attempt-${kind}`,
+      runId: "9013",
+      repository: "owner/repository",
+      revision: "provider123",
+      defaultBranch: "main",
+      modelAlias: "repair",
+      runtimeAlias: "node-24",
+      allowedPaths: ["src/**"],
+      installCommand: ["npm", "ci"],
+      validationCommand: ["npm", "test"],
+      primaryFailure: {
+        jobId: "17",
+        jobName: "test",
+        stepNumber: 2,
+        stepName: "Unit tests",
+        log: "expected 2, received 1",
+      },
+    }),
+  ).resolves.toEqual({ outcome: "unresolved" });
+
+  expect(calls).toBe(1);
+  expect(checks[0]?.body).toContain(reason);
+});
+
+it("selects the Repository Contract model alias independently for each attempt", async () => {
+  const selectedAliases: string[] = [];
+  const orchestrator = createRepairOrchestrator({
+    github: {
+      async readTrackedTextFiles() {
+        throw new Error("source files must not be read");
+      },
+      async ensureValidatedRepair() {
+        throw new Error("a Repair PR must not be published");
+      },
+      async completeCheck() {},
+    },
+    models: {
+      createRepairProvider(alias) {
+        selectedAliases.push(alias);
+        return {
+          alias,
+          provider: `provider-${alias}`,
+          model: `model-${alias}`,
+          async analyzeFailure() {
+            return { actionable: false, summary: "not actionable", requestedFiles: [] };
+          },
+          async proposeRepair() {
+            throw new Error("a Repair Proposal must not be requested");
+          },
+        };
+      },
+    },
+    sandbox: {
+      async validate() {
+        throw new Error("the sandbox must not run");
+      },
+    },
+    persistence: { async transition() {}, publishIfCurrent: publishCurrent },
+    clock: { now: () => new Date("2026-11-20T12:00:00.000Z") },
+  });
+  const attempt = {
+    runId: "9014",
+    repository: "owner/repository",
+    revision: "aliases123",
+    defaultBranch: "main",
+    runtimeAlias: "node-24",
+    allowedPaths: ["src/**"],
+    installCommand: ["npm", "ci"],
+    validationCommand: ["npm", "test"],
+    primaryFailure: {
+      jobId: "17",
+      jobName: "test",
+      stepNumber: 2,
+      stepName: "Unit tests",
+      log: "expected 2, received 1",
+    },
+  };
+
+  await expect(
+    orchestrator.advance({ ...attempt, attemptId: "attempt-fast", modelAlias: "fast" }),
+  ).resolves.toEqual({ outcome: "unresolved" });
+  await expect(
+    orchestrator.advance({ ...attempt, attemptId: "attempt-deep", modelAlias: "deep" }),
+  ).resolves.toEqual({ outcome: "unresolved" });
+
+  expect(selectedAliases).toEqual(["fast", "deep"]);
 });
