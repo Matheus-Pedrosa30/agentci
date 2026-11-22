@@ -4,6 +4,39 @@ import { expect, it } from "vitest";
 
 import { createGitHubAppIntakeApi } from "../src/github-api.js";
 
+it("authorizes Check actions from the installation-scoped repository permission", async () => {
+  const privateKey = generateKeyPairSync("rsa", {
+    modulusLength: 1024,
+    privateKeyEncoding: { format: "pem", type: "pkcs8" },
+    publicKeyEncoding: { format: "pem", type: "spki" },
+  }).privateKey;
+  const requests: string[] = [];
+  const api = createGitHubAppIntakeApi({
+    appId: "12345",
+    privateKey,
+    fetch: async (input) => {
+      const url = String(input);
+      if (url.endsWith("/app/installations/99/access_tokens")) {
+        return Response.json({ token: "installation-token" });
+      }
+      requests.push(url);
+      return Response.json({ permission: "maintain" });
+    },
+  });
+
+  await expect(
+    api.getRepositoryPermission?.({
+      installationId: 99,
+      owner: "example",
+      repository: "repository",
+      username: "maintainer",
+    }),
+  ).resolves.toBe("maintain");
+  expect(requests).toEqual([
+    "https://api.github.com/repos/example/repository/collaborators/maintainer/permission",
+  ]);
+});
+
 it("reads the exact-revision Repository Contract through an installation-scoped GitHub API token", async () => {
   const privateKey = generateKeyPairSync("rsa", {
     modulusLength: 1024,

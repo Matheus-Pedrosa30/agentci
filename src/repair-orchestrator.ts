@@ -55,6 +55,7 @@ export interface SandboxRuntime {
     installCommand: readonly string[];
     validationCommand: readonly string[];
     proposal: RepairProposal;
+    baselineProposal?: RepairProposal;
     signal?: AbortSignal;
   }): Promise<
     | { outcome: "passed"; changedFiles: readonly string[] }
@@ -68,6 +69,11 @@ interface PublicationReport {
   revision: string;
   title: string;
   body: string;
+  actions?: readonly {
+    label: string;
+    description: string;
+    identifier: string;
+  }[];
 }
 
 export interface GitHubPublication {
@@ -97,6 +103,16 @@ export interface RepairAttemptPersistence {
     input: { attemptId: string; at: string },
     publish: () => Promise<T>,
   ): Promise<{ outcome: "published"; value: T } | { outcome: "stale" }>;
+  offerContinuation?(input: {
+    attemptId: string;
+    at: string;
+    expiresAt: string;
+    proposal: RepairProposal;
+    revealedFailure: PrimaryFailure;
+    cumulativeChangedFiles: readonly string[];
+    cumulativeChangedLines: number;
+  }): Promise<string>;
+  offerRetry?(input: { attemptId: string; at: string; expiresAt: string }): Promise<string>;
 }
 
 export interface RepairClock {
@@ -116,6 +132,37 @@ export interface RepairAttemptInput {
   installCommand: readonly string[];
   validationCommand: readonly string[];
   primaryFailure: PrimaryFailure;
+  baseline?: {
+    proposal: RepairProposal;
+    cumulativeChangedFiles: readonly string[];
+    cumulativeChangedLines: number;
+  };
+}
+
+function mergeProposals(
+  baseline: RepairProposal | undefined,
+  proposal: RepairProposal,
+): RepairProposal {
+  const changes = new Map<string, RepairProposalChange>();
+  for (const change of baseline?.changes ?? []) changes.set(change.path, change);
+  for (const change of proposal.changes) changes.set(change.path, change);
+  return { summary: proposal.summary, changes: [...changes.values()] };
+}
+
+function cumulativeLineage(
+  baseline: RepairAttemptInput["baseline"],
+  proposal: RepairProposal,
+  changedLines: number,
+): { changedFiles: string[]; changedLines: number } {
+  return {
+    changedFiles: [
+      ...new Set([
+        ...(baseline?.cumulativeChangedFiles ?? []),
+        ...proposal.changes.map((change) => change.path),
+      ]),
+    ],
+    changedLines: (baseline?.cumulativeChangedLines ?? 0) + changedLines,
+  };
 }
 
 function validUsage(value: unknown): value is TokenUsage {
@@ -158,11 +205,14 @@ function parseAnalysis(value: unknown):
   };
 }
 
-function parseValidation(
-  value: unknown,
-):
+function parseValidation(value: unknown):
   | { outcome: "passed"; changedFiles: readonly string[] }
-  | { outcome: "failed"; summary: string; observedFailureIdentity?: string }
+  | {
+      outcome: "failed";
+      summary: string;
+      observedFailureIdentity?: string;
+      revealedFailure?: PrimaryFailure;
+    }
   | undefined {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
   const candidate = value as {
@@ -170,6 +220,7 @@ function parseValidation(
     changedFiles?: unknown;
     summary?: unknown;
     observedFailureIdentity?: unknown;
+    revealedFailure?: unknown;
   };
   if (
     candidate.outcome === "passed" &&
@@ -182,7 +233,8 @@ function parseValidation(
     candidate.outcome === "failed" &&
     typeof candidate.summary === "string" &&
     (candidate.observedFailureIdentity === undefined ||
-      typeof candidate.observedFailureIdentity === "string")
+      typeof candidate.observedFailureIdentity === "string") &&
+    (candidate.revealedFailure === undefined || validPrimaryFailure(candidate.revealedFailure))
   ) {
     return {
       outcome: "failed",
@@ -190,9 +242,24 @@ function parseValidation(
       ...(candidate.observedFailureIdentity === undefined
         ? {}
         : { observedFailureIdentity: candidate.observedFailureIdentity }),
+      ...(candidate.revealedFailure === undefined
+        ? {}
+        : { revealedFailure: candidate.revealedFailure }),
     };
   }
   return undefined;
+}
+
+function validPrimaryFailure(value: unknown): value is PrimaryFailure {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return false;
+  const failure = value as Partial<PrimaryFailure>;
+  return (
+    typeof failure.jobId === "string" &&
+    typeof failure.jobName === "string" &&
+    Number.isSafeInteger(failure.stepNumber) &&
+    typeof failure.stepName === "string" &&
+    typeof failure.log === "string"
+  );
 }
 
 function tokenCount(usage: TokenUsage | undefined, key: keyof TokenUsage): number {
@@ -256,6 +323,13 @@ export function createRepairOrchestrator(dependencies: RepairOrchestratorDepende
           status: "unresolved",
           at: at(),
         });
+        const retryIdentifier = dependencies.persistence.offerRetry
+          ? await dependencies.persistence.offerRetry({
+              attemptId: attempt.attemptId,
+              at: at(),
+              expiresAt: new Date(dependencies.clock.now().getTime() + 15 * 60_000).toISOString(),
+            })
+          : undefined;
         await dependencies.github.completeCheck({
           repository: attempt.repository,
           revision: attempt.revision,
@@ -271,6 +345,17 @@ export function createRepairOrchestrator(dependencies: RepairOrchestratorDepende
                 ]
               : []),
           ].join("\n"),
+          ...(retryIdentifier
+            ? {
+                actions: [
+                  {
+                    label: "Retry repair",
+                    description: "Restart from the original failure.",
+                    identifier: retryIdentifier,
+                  },
+                ],
+              }
+            : {}),
         });
         return { outcome: "unresolved" };
       };
@@ -329,6 +414,9 @@ export function createRepairOrchestrator(dependencies: RepairOrchestratorDepende
       const files = Object.fromEntries(
         requested.files.map((path) => [path, redactAndBoundSourceFile(sources[path] as string)]),
       );
+      for (const change of attempt.baseline?.proposal.changes ?? []) {
+        if (Object.hasOwn(files, change.path)) files[change.path] = change.content;
+      }
       const failureIdentity = primaryFailureIdentity({
         revision: attempt.revision,
         workflow: attempt.workflow ?? "",
@@ -393,6 +481,7 @@ export function createRepairOrchestrator(dependencies: RepairOrchestratorDepende
             installCommand: attempt.installCommand,
             validationCommand: attempt.validationCommand,
             proposal,
+            ...(attempt.baseline ? { baselineProposal: attempt.baseline.proposal } : {}),
           });
         } catch {
           return unresolved("Sandbox validation could not be completed.", audit());
@@ -406,7 +495,8 @@ export function createRepairOrchestrator(dependencies: RepairOrchestratorDepende
           return unresolved("Sandbox validation returned an invalid result.", audit());
         }
         if (validation.outcome === "passed") {
-          changedFiles = proposal.changes.map((change) => change.path);
+          const cumulativeProposal = mergeProposals(attempt.baseline?.proposal, proposal);
+          changedFiles = cumulativeProposal.changes.map((change) => change.path);
           if (
             validation.changedFiles.length !== changedFiles.length ||
             validation.changedFiles.some((path) => !changedFiles.includes(path)) ||
@@ -423,6 +513,60 @@ export function createRepairOrchestrator(dependencies: RepairOrchestratorDepende
           proposalCount,
           validation,
         });
+        const revealedFailureIdentity = validation.revealedFailure
+          ? primaryFailureIdentity({
+              revision: attempt.revision,
+              workflow: attempt.workflow ?? "",
+              jobId: validation.revealedFailure.jobId,
+              stepNumber: validation.revealedFailure.stepNumber,
+              evidence: validation.revealedFailure.log,
+            })
+          : undefined;
+        if (
+          classification.outcome === "unresolved" &&
+          validation.observedFailureIdentity !== failureIdentity &&
+          validation.observedFailureIdentity === revealedFailureIdentity &&
+          validation.revealedFailure &&
+          dependencies.persistence.offerContinuation
+        ) {
+          await dependencies.persistence.transition({
+            attemptId: attempt.attemptId,
+            status: "unresolved",
+            at: at(),
+          });
+          const lineage = cumulativeLineage(attempt.baseline, proposal, evaluation.changedLines);
+          const actionIdentifier = await dependencies.persistence.offerContinuation({
+            attemptId: attempt.attemptId,
+            at: at(),
+            expiresAt: new Date(dependencies.clock.now().getTime() + 15 * 60_000).toISOString(),
+            proposal: mergeProposals(attempt.baseline?.proposal, proposal),
+            revealedFailure: validation.revealedFailure,
+            cumulativeChangedFiles: lineage.changedFiles,
+            cumulativeChangedLines: lineage.changedLines,
+          });
+          const fileCount = lineage.changedFiles.length;
+          await dependencies.github.completeCheck({
+            repository: attempt.repository,
+            revision: attempt.revision,
+            conclusion: "neutral",
+            title: "AgentCI stopped at a newly revealed Primary Failure",
+            body: [
+              "Unresolved Repair: Validation revealed a different Primary Failure; Continuation requires developer authorization.",
+              `Cumulative change: ${fileCount} ${fileCount === 1 ? "file" : "files"}; ${lineage.changedLines} lines`,
+              `Proposal count: ${proposalCount}`,
+              `Rejected proposals: ${rejections.map((summary, index) => `${index + 1}. ${auditText(summary)}`).join("; ")}`,
+              `Usage: Input tokens: ${inputTokens}; output tokens: ${outputTokens}`,
+            ].join("\n"),
+            actions: [
+              {
+                label: "Continue repair",
+                description: "Accept proposal and investigate next.",
+                identifier: actionIdentifier,
+              },
+            ],
+          });
+          return { outcome: "unresolved" };
+        }
         if (classification.outcome === "unresolved") {
           return unresolved(classification.explanation, audit());
         }
@@ -458,7 +602,7 @@ export function createRepairOrchestrator(dependencies: RepairOrchestratorDepende
             baseBranch: attempt.defaultBranch,
             headBranch,
             draft: true,
-            changes: proposal.changes,
+            changes: mergeProposals(attempt.baseline?.proposal, proposal).changes,
             title: `Validated Repair for workflow run ${attempt.runId}`,
             body: report,
           }),
