@@ -10,11 +10,16 @@ export interface RepositoryContract {
   allowedPaths: string[];
 }
 
-const OPERATOR_MODEL_FIELDS = new Set([
-  "endpoint",
-  "baseURL",
-  "credential",
-  "apiKeyEnvironmentVariable",
+const REPOSITORY_CONTRACT_FIELDS = new Set([
+  "version",
+  "workflow",
+  "job",
+  "branches",
+  "model",
+  "runtime",
+  "install",
+  "test",
+  "allowedPaths",
 ]);
 
 function object(value: unknown): Record<string, unknown> | undefined {
@@ -34,7 +39,9 @@ export function parseRepositoryContract(source: string): RepositoryContract | un
   try {
     const value = object(JSON.parse(source));
     if (!value) return undefined;
-    if (Object.keys(value).some((field) => OPERATOR_MODEL_FIELDS.has(field))) return undefined;
+    if (Object.keys(value).some((field) => !REPOSITORY_CONTRACT_FIELDS.has(field))) {
+      return undefined;
+    }
     const branches = stringArray(value.branches);
     const install = stringArray(value.install);
     const test = stringArray(value.test);

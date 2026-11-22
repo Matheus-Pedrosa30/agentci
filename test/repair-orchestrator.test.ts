@@ -950,3 +950,67 @@ it.each([
   expect(calls).toBe(1);
   expect(checks[0]?.body).toContain(reason);
 });
+
+it("selects the Repository Contract model alias independently for each attempt", async () => {
+  const selectedAliases: string[] = [];
+  const orchestrator = createRepairOrchestrator({
+    github: {
+      async readTrackedTextFiles() {
+        throw new Error("source files must not be read");
+      },
+      async ensureValidatedRepair() {
+        throw new Error("a Repair PR must not be published");
+      },
+      async completeCheck() {},
+    },
+    models: {
+      createRepairProvider(alias) {
+        selectedAliases.push(alias);
+        return {
+          alias,
+          provider: `provider-${alias}`,
+          model: `model-${alias}`,
+          async analyzeFailure() {
+            return { actionable: false, summary: "not actionable", requestedFiles: [] };
+          },
+          async proposeRepair() {
+            throw new Error("a Repair Proposal must not be requested");
+          },
+        };
+      },
+    },
+    sandbox: {
+      async validate() {
+        throw new Error("the sandbox must not run");
+      },
+    },
+    persistence: { async transition() {}, publishIfCurrent: publishCurrent },
+    clock: { now: () => new Date("2026-11-20T12:00:00.000Z") },
+  });
+  const attempt = {
+    runId: "9014",
+    repository: "owner/repository",
+    revision: "aliases123",
+    defaultBranch: "main",
+    runtimeAlias: "node-24",
+    allowedPaths: ["src/**"],
+    installCommand: ["npm", "ci"],
+    validationCommand: ["npm", "test"],
+    primaryFailure: {
+      jobId: "17",
+      jobName: "test",
+      stepNumber: 2,
+      stepName: "Unit tests",
+      log: "expected 2, received 1",
+    },
+  };
+
+  await expect(
+    orchestrator.advance({ ...attempt, attemptId: "attempt-fast", modelAlias: "fast" }),
+  ).resolves.toEqual({ outcome: "unresolved" });
+  await expect(
+    orchestrator.advance({ ...attempt, attemptId: "attempt-deep", modelAlias: "deep" }),
+  ).resolves.toEqual({ outcome: "unresolved" });
+
+  expect(selectedAliases).toEqual(["fast", "deep"]);
+});

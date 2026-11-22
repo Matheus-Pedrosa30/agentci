@@ -14,8 +14,8 @@ const validContract = {
   allowedPaths: ["src/**"],
 };
 
-it.each(["endpoint", "baseURL", "credential", "apiKeyEnvironmentVariable"])(
-  "rejects a Repository Contract that attempts to set %s",
+it.each(["endpoint", "baseURL", "credential", "apiKeyEnvironmentVariable", "unknown"])(
+  "rejects the non-contract field %s",
   (field) => {
     expect(
       parseRepositoryContract(JSON.stringify({ ...validContract, [field]: "repository-value" })),

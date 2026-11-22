@@ -64,12 +64,80 @@ describe("trusted model registry", () => {
     });
   });
 
+  it("runs an imported custom LanguageModelV4 through the shared repair provider", async () => {
+    const calls: unknown[] = [];
+    const outputs = [
+      {
+        actionable: true,
+        summary: "Inspect the selected source file.",
+        requestedFiles: ["src/math.ts"],
+      },
+      {
+        summary: "Correct the returned value.",
+        changes: [{ path: "src/math.ts", content: "export const value = 2;\n" }],
+      },
+    ];
+    const model: LanguageModelV4 = {
+      specificationVersion: "v4",
+      provider: "operator-custom",
+      modelId: "custom-repair-model",
+      supportedUrls: {},
+      async doGenerate(options) {
+        calls.push(options);
+        return {
+          content: [{ type: "text", text: JSON.stringify(outputs[calls.length - 1]) }],
+          finishReason: { unified: "stop", raw: "stop" },
+          usage: {
+            inputTokens: { total: 10, noCache: 10, cacheRead: 0, cacheWrite: 0 },
+            outputTokens: { total: 5, text: 5, reasoning: 0 },
+          },
+          warnings: [],
+        };
+      },
+      async doStream() {
+        throw new Error("streaming is not used");
+      },
+    };
+    const provider = createModelRegistry({ custom: model }).createRepairProvider("custom");
+    const evidence = {
+      jobName: "test",
+      stepNumber: 2,
+      stepName: "Unit tests",
+      log: "expected 2, received 1",
+      allowedPaths: ["src/**"],
+    };
+
+    await expect(provider.analyzeFailure(evidence)).resolves.toMatchObject(outputs[0]!);
+    await expect(
+      provider.proposeRepair({
+        evidence,
+        files: { "src/math.ts": "export const value = 1;\n" },
+        previousRejections: [],
+      }),
+    ).resolves.toMatchObject(outputs[1]!);
+    expect(calls).toHaveLength(2);
+    expect(calls).toEqual([
+      expect.objectContaining({ tools: undefined }),
+      expect.objectContaining({ tools: undefined }),
+    ]);
+  });
+
   it("rejects a Repository Contract model alias that the operator did not allowlist", () => {
     const registry = createModelRegistry({ repair: customModel() });
 
     expect(() => registry.resolve("repository-controlled")).toThrow(
       new ModelSelectionError("model_alias_not_allowed"),
     );
+  });
+
+  it("requires a built-in credential to exist in the operator environment", () => {
+    expect(() =>
+      createOpenAIModel({
+        modelId: "gpt-test",
+        apiKeyEnvironmentVariable: "OPERATOR_OPENAI_KEY",
+        environment: {},
+      }),
+    ).toThrow("model_credential_missing");
   });
 });
 
@@ -247,6 +315,135 @@ describe("built-in provider contracts", () => {
       /OPERATOR_ANTHROPIC_KEY|anthropic-secret/u,
     );
   });
+
+  it.each(["openai", "anthropic", "openai-compatible"] as const)(
+    "runs %s analysis and repair proposals through mocked HTTP without tools or credential metadata",
+    async (providerName) => {
+      const requests: Array<{
+        url: string;
+        headers: Headers;
+        body: Record<string, unknown>;
+      }> = [];
+      const fetch = vi.fn<typeof globalThis.fetch>(async (input, init) => {
+        requests.push({
+          url: String(input),
+          headers: new Headers(init?.headers),
+          body: JSON.parse(String(init?.body)) as Record<string, unknown>,
+        });
+        const output =
+          requests.length === 1
+            ? JSON.stringify({
+                actionable: true,
+                summary: "The assertion is actionable.",
+                requestedFiles: ["src/math.ts"],
+              })
+            : JSON.stringify({
+                summary: "Correct the returned value.",
+                changes: [{ path: "src/math.ts", content: "export const value = 2;\n" }],
+              });
+        return providerName === "anthropic"
+          ? new Response(
+              JSON.stringify({
+                id: `msg_${requests.length}`,
+                type: "message",
+                role: "assistant",
+                model: "claude-test",
+                content: [{ type: "text", text: output }],
+                stop_reason: "end_turn",
+                stop_sequence: null,
+                usage:
+                  requests.length === 1
+                    ? { input_tokens: 12, output_tokens: 7 }
+                    : { input_tokens: 15, output_tokens: 8 },
+              }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            )
+          : new Response(
+              JSON.stringify({
+                id: `chatcmpl-${requests.length}`,
+                created: 1,
+                model: "gpt-test",
+                choices: [
+                  {
+                    index: 0,
+                    message: { role: "assistant", content: output },
+                    finish_reason: "stop",
+                  },
+                ],
+                usage:
+                  requests.length === 1
+                    ? { prompt_tokens: 12, completion_tokens: 7, total_tokens: 19 }
+                    : { prompt_tokens: 15, completion_tokens: 8, total_tokens: 23 },
+              }),
+              { status: 200, headers: { "content-type": "application/json" } },
+            );
+      });
+      const common = {
+        alias: "repair",
+        modelId: providerName === "anthropic" ? "claude-test" : "gpt-test",
+        apiKeyEnvironmentVariable: "OPERATOR_MODEL_KEY",
+        environment: { OPERATOR_MODEL_KEY: "operator-secret" },
+        fetch,
+      };
+      const provider =
+        providerName === "anthropic"
+          ? createAnthropicRepairProvider(common)
+          : providerName === "openai-compatible"
+            ? createOpenAICompatibleRepairProvider({
+                ...common,
+                baseURL: "https://operator-model.invalid/v1",
+              })
+            : createOpenAIRepairProvider(common);
+
+      await expect(
+        provider.analyzeFailure({
+          jobName: "test",
+          stepNumber: 2,
+          stepName: "Unit tests",
+          log: "expected 2, received 1",
+          allowedPaths: ["src/**"],
+        }),
+      ).resolves.toEqual({
+        actionable: true,
+        summary: "The assertion is actionable.",
+        requestedFiles: ["src/math.ts"],
+        usage: { inputTokens: 12, outputTokens: 7 },
+      });
+
+      await expect(
+        provider.proposeRepair({
+          evidence: {
+            jobName: "test",
+            stepNumber: 2,
+            stepName: "Unit tests",
+            log: "expected 2, received 1",
+            allowedPaths: ["src/**"],
+          },
+          files: { "src/math.ts": "export const value = 1;\n" },
+          previousRejections: [],
+        }),
+      ).resolves.toEqual({
+        summary: "Correct the returned value.",
+        changes: [{ path: "src/math.ts", content: "export const value = 2;\n" }],
+        usage: { inputTokens: 15, outputTokens: 8 },
+      });
+      expect(requests).toHaveLength(2);
+      const expectedUrl =
+        providerName === "anthropic"
+          ? "https://api.anthropic.com/v1/messages"
+          : providerName === "openai-compatible"
+            ? "https://operator-model.invalid/v1/chat/completions"
+            : "https://api.openai.com/v1/chat/completions";
+      expect(requests.map(({ url }) => url)).toEqual([expectedUrl, expectedUrl]);
+      for (const request of requests) {
+        expect(
+          request.headers.get(providerName === "anthropic" ? "x-api-key" : "authorization"),
+        ).toContain("operator-secret");
+        expect(request.body).not.toHaveProperty("tools");
+        expect(JSON.stringify(request.body)).not.toMatch(/OPERATOR_MODEL_KEY|operator-secret/u);
+      }
+    },
+  );
 
   it("classifies a built-in provider quota response explicitly without fallback", async () => {
     const fetch = vi.fn<typeof globalThis.fetch>(async () =>

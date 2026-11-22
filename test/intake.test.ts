@@ -148,7 +148,10 @@ describe("signed GitHub webhook intake", () => {
     const checks: unknown[] = [];
     const github: GitHubIntakeApi = {
       async getRepositoryContract() {
-        return JSON.stringify({ ...JSON.parse(validContract), ignoredSecret: "do-not-retain" });
+        return JSON.stringify({
+          ...JSON.parse(validContract),
+          branches: ["main", "do-not-retain"],
+        });
       },
       async getWorkflowJobs() {
         return [{ name: "test", conclusion: "failure" }];
